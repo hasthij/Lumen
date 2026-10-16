@@ -12,6 +12,7 @@ use crate::config::Appearance;
 pub const PRESETS: &[(&str, &str, u32, u32)] = &[
     // (id, name, tint, accent)
     ("graphite", "Graphite", 0x202022, 0),
+    ("black", "Ultra black", 0x000000, 0xFFFFFF),
     ("midnight", "Midnight", 0x0E1830, 0x6EA8FF),
     ("violet", "Violet", 0x1C1430, 0xB18CFF),
     ("rose", "Rose", 0x2A121D, 0xFF8FB3),
@@ -133,6 +134,9 @@ pub fn apply_backdrop(hwnd: HWND, a: &Appearance, popup: bool) -> bool {
             let corner = DWMWCP_ROUND;
             let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as *const _, 4);
         }
+        // No coloured or white outline around the window (DWMWA_COLOR_NONE).
+        let none: u32 = 0xFFFF_FFFE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const _ as *const _, 4);
         let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
         let kind = match a.backdrop.as_str() {

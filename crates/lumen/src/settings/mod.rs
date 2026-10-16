@@ -170,6 +170,8 @@ pub struct Settings {
     /// Toggle knob positions (0 = off, 1 = on), eased toward their target each frame.
     anim: std::collections::HashMap<String, f32>,
     animating: bool,
+    /// Page fade-in progress, 0 to 1.
+    page_fade: f32,
 }
 
 impl Settings {
@@ -221,6 +223,7 @@ impl Settings {
             backdrop,
             anim: std::collections::HashMap::new(),
             animating: false,
+            page_fade: 1.0,
         }
     }
 
@@ -299,7 +302,7 @@ impl Settings {
         match s {
             Slider::Strength => self.cfg.appearance.strength,
             Slider::TintHue => hsv_of(&self.cfg.appearance.tint, [0.12; 3]).0 / 360.0,
-            Slider::TintLight => (hsv_of(&self.cfg.appearance.tint, [0.12; 3]).2 - 0.04) / 0.4,
+            Slider::TintLight => hsv_of(&self.cfg.appearance.tint, [0.12; 3]).2 / 0.4,
             Slider::ClockSize => (self.cfg.clock.size - 0.5) / 2.0,
             Slider::ClockOpacity => (self.cfg.clock.opacity - 0.1) / 0.9,
             Slider::LauncherScale => (self.cfg.launcher.scale - 0.7) / 1.3,
@@ -319,7 +322,7 @@ impl Settings {
             Slider::Strength => self.cfg.appearance.strength = (t * 100.0).round() / 100.0,
             Slider::TintHue | Slider::TintLight => {
                 let (h, _, v) = hsv_of(&self.cfg.appearance.tint, [0.12; 3]);
-                let (h, v) = if s == Slider::TintHue { (t * 360.0, v.max(0.08)) } else { (h, 0.04 + t * 0.4) };
+                let (h, v) = if s == Slider::TintHue { (t * 360.0, v.max(0.08)) } else { (h, t * 0.4) };
                 self.cfg.appearance.tint = theme::to_hex(theme::hsv(h, 0.6, v));
                 self.cfg.appearance.theme = "custom".into();
             }
@@ -370,6 +373,9 @@ impl Settings {
         }
         match hit {
             Hit::Nav(p) => {
+                if self.page != p {
+                    self.page_fade = 0.0;
+                }
                 self.page = p;
                 self.scroll = 0.0;
             }
@@ -441,7 +447,17 @@ impl Settings {
                 }
             }
             Hit::Theme(id) => {
+                let was_black = self.cfg.appearance.theme == "black";
                 self.cfg.appearance.theme = id.into();
+                if id == "black" {
+                    // OLED black: solid black with no backdrop showing through.
+                    self.cfg.appearance.strength = 1.0;
+                    self.cfg.appearance.backdrop = "solid".into();
+                } else if was_black {
+                    let d = crate::config::Appearance::default();
+                    self.cfg.appearance.strength = d.strength;
+                    self.cfg.appearance.backdrop = d.backdrop;
+                }
                 self.commit_config();
             }
             Hit::Backdrop(id) => {
@@ -811,6 +827,14 @@ impl Settings {
             Page::Taskbar => self.page_taskbar(top),
             Page::About => self.page_about(top),
         };
+        // A quick fade-in when the page changes: a veil in the window's own colour that thins out.
+        if self.page_fade < 1.0 {
+            self.page_fade = (self.page_fade + 0.14).min(1.0);
+            let [tr, tg, tb] = self.theme.tint;
+            let veil = (1.0 - self.page_fade) * 0.9;
+            self.canvas.fill(Rect::new(SIDEBAR, HEADER_H, W - SIDEBAR, H - HEADER_H), 0.0, rgba(tr * 0.5, tg * 0.5, tb * 0.5, veil));
+            self.animating = true;
+        }
         self.canvas.unclip();
         self.content_h = end + self.scroll - HEADER_H + 24.0;
         // Regions scrolled out of view must not be clickable.
@@ -1026,7 +1050,8 @@ impl Settings {
                 self.canvas.stroke(r, 8.0, 1.5, self.accent());
             }
             // Two-tone dot: tint on the left, accent on the right.
-            self.canvas.circle(x, cy - 8.0, 13.0, rgba(base[0] * 2.2, base[1] * 2.2, base[2] * 2.2, 1.0));
+            self.canvas.circle(x, cy - 8.0, 13.0, white(0.18));
+            self.canvas.circle(x, cy - 8.0, 12.0, rgba((base[0] * 2.2).max(0.0), (base[1] * 2.2).max(0.0), (base[2] * 2.2).max(0.0), 1.0));
             self.canvas.circle(x + 6.0, cy - 8.0, 7.0, rgba(a[0], a[1], a[2], 1.0));
             let short = name.split(' ').next().unwrap_or(name);
             self.canvas.text(short, Rect::new(x - 28.0, cy + 10.0, 56.0, 16.0), Font::Text, 10.5, 400, white(0.75), Align::Center);
@@ -1040,7 +1065,7 @@ impl Settings {
         self.slider_row(y + 64.0, "Hue", Slider::TintHue, Some(&rail));
         let tint = theme::parse_hex(&self.cfg.appearance.tint).unwrap_or([0.12; 3]);
         let (h, _, _) = theme::to_hsv(tint);
-        let dark: Vec<Color> = (0..=4).map(|i| { let c = theme::hsv(h, 0.6, 0.04 + i as f32 * 0.1); rgba(c[0], c[1], c[2], 1.0) }).collect();
+        let dark: Vec<Color> = (0..=4).map(|i| { let c = theme::hsv(h, 0.6, i as f32 * 0.1); rgba(c[0], c[1], c[2], 1.0) }).collect();
         self.slider_row(y + 98.0, "Brightness", Slider::TintLight, Some(&dark));
         y += 146.0;
 
@@ -1361,6 +1386,7 @@ unsafe fn create_window() -> Result<HWND> {
         lpfnWndProc: Some(wndproc),
         hInstance: instance.into(),
         hCursor: LoadCursorW(None, IDC_ARROW)?,
+        hbrBackground: windows::Win32::Graphics::Gdi::CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0020_2020)),
         lpszClassName: w!("LumenSettings"),
         ..Default::default()
     };

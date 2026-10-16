@@ -813,6 +813,7 @@ unsafe fn create_window() -> Result<HWND> {
         lpfnWndProc: Some(wndproc),
         hInstance: instance.into(),
         hCursor: LoadCursorW(None, IDC_ARROW)?,
+        hbrBackground: CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0020_2020)),
         lpszClassName: w!("LumenLauncher"),
         ..Default::default()
     };
