@@ -54,6 +54,14 @@ struct Measure {
     substitutes: Vec<(String, String)>,
 }
 
+/// Lumen-side adjustments applied over the skin's own variables (files are not touched).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overrides {
+    pub hour24: Option<bool>,
+    /// "r,g,b" applied to every variable whose name ends in "Color".
+    pub color: Option<String>,
+}
+
 pub struct Skin {
     pub file: PathBuf,
     pub fonts_dir: PathBuf,
@@ -67,7 +75,7 @@ pub struct Skin {
 
 impl Skin {
     /// `skins_root` is the Skins folder; `rel` is e.g. `Summit\Time\Time.ini`.
-    pub fn load(skins_root: &Path, rel: &str) -> Result<Self, String> {
+    pub fn load(skins_root: &Path, rel: &str, overrides: &Overrides) -> Result<Self, String> {
         let file = skins_root.join(rel);
         let ini = Ini::load(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
 
@@ -99,6 +107,7 @@ impl Skin {
         let mut sections = Vec::new();
         let mut seen = HashSet::new();
         skin.flatten(ini, &mut sections, &mut seen, 0);
+        skin.apply(overrides);
 
         let mut unsupported = Vec::new();
         for s in sections {
@@ -152,6 +161,26 @@ impl Skin {
             match out.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&section.name)) {
                 Some(existing) => existing.entries.extend(section.entries),
                 None => out.push(section),
+            }
+        }
+    }
+
+    fn apply(&mut self, o: &Overrides) {
+        if let Some(h24) = o.hour24 {
+            // Skins like Summit switch with Format=H/I plus Hidden/Hidden2 for the two meters.
+            if self.vars.get("format").is_some_and(|v| matches!(unquote(v), "H" | "I")) {
+                self.vars.insert("format".into(), if h24 { "H" } else { "I" }.into());
+            }
+            if self.vars.contains_key("hidden") && self.vars.contains_key("hidden2") {
+                self.vars.insert("hidden".into(), if h24 { "0" } else { "1" }.into());
+                self.vars.insert("hidden2".into(), if h24 { "1" } else { "0" }.into());
+            }
+        }
+        if let Some(c) = &o.color {
+            for (k, v) in self.vars.iter_mut() {
+                if k.ends_with("color") {
+                    *v = c.clone();
+                }
             }
         }
     }
