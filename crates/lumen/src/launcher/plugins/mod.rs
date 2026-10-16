@@ -106,11 +106,7 @@ fn apps(apps: &[App], q: &str, explicit: bool, out: &mut Vec<Item>) {
             })
         };
         let Some(s) = s else { continue };
-        // The folder it lives in is enough; the app's own name is already the title.
-        let subtitle = match (&app.path, app.packaged) {
-            (Some(path), false) => super::item::folder_label(path),
-            _ => "App".to_string(),
-        };
+        let subtitle = String::new();
         let mut item = Item::new(Kind::App, app.name.clone(), subtitle, Action::open(app.launch.clone()))
             .icon(Icon::Shell(app.launch.clone()))
             .key(format!("app:{}", app.launch))

@@ -225,20 +225,10 @@ impl Item {
     }
 }
 
-/// The folder a file lives in, shortened for display: `C:\Users\you\Documents\Notes` becomes
-/// `~\Documents\Notes`. A path ending in a backslash is already a folder.
-pub fn folder_label(path: &str) -> String {
-    let dir = match path.trim_end_matches('\\').rfind('\\') {
-        Some(i) if !path.ends_with('\\') => &path[..i],
-        _ => path.trim_end_matches('\\'),
-    };
-    let dir = if dir.len() == 2 && dir.ends_with(':') { format!("{dir}\\") } else { dir.to_string() };
-    match std::env::var("USERPROFILE") {
-        Ok(home) if !home.is_empty() && dir.len() >= home.len() && dir[..home.len()].eq_ignore_ascii_case(&home) => {
-            format!("~{}", &dir[home.len()..])
-        }
-        _ => dir,
-    }
+/// Subtitle for files, folders and apps: none. The name says what it is, and the folder is one
+/// button away ("Show in folder"), so a path under every result is just noise.
+pub fn folder_label(_path: &str) -> String {
+    String::new()
 }
 
 pub fn hwnd_of(raw: isize) -> HWND {

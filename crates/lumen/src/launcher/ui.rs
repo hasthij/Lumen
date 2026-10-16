@@ -446,7 +446,9 @@ impl Renderer {
         let max_w = right_edge - text_left;
         brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.95));
         let title = self.layout(&item.title, 14.5, 500, 0, max_w, 22.0)?;
-        t.DrawTextLayout(pt(text_left, top + 6.0), &title, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // Without a subtitle the name sits in the middle of the row.
+        let title_y = if item.subtitle.is_empty() && !(selected && v.confirming) { top + (ROW_H - 22.0) / 2.0 } else { top + 6.0 };
+        t.DrawTextLayout(pt(text_left, title_y), &title, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
         let (sub, color) = if selected && v.confirming {
             ("Press Enter again to confirm".to_string(), rgba(0.96, 0.58, 0.58, 1.0))
         } else {

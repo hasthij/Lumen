@@ -105,7 +105,7 @@ fn folder(q: &str, out: &mut Vec<Item>) {
 
     if filter.is_empty() {
         out.push(file_actions(
-            Item::new(Kind::Folder, dir.trim_end_matches('\\').to_string() + "\\", "Open folder", Action::open(dir))
+            Item::new(Kind::Folder, dir.trim_end_matches('\\').to_string() + "\\", "", Action::open(dir))
                 .icon(Icon::Shell(dir.to_string()))
                 .key(format!("folder:{dir}"))
                 .score(6000),
