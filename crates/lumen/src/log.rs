@@ -13,9 +13,11 @@ const MAX_BYTES: u64 = 1024 * 1024;
 pub fn dir() -> PathBuf {
     // Development aid: logs go to the repo's lumen-logs folder when it exists, because the
     // desktop app that builds Lumen sees a virtualized copy of AppData.
-    let dev = PathBuf::from(r"C:\Main\Lumen\lumen-logs");
-    if dev.is_dir() {
-        return dev;
+    if cfg!(feature = "dev-logs") {
+        let dev = PathBuf::from(r"C:\Main\Lumen\lumen-logs");
+        if dev.is_dir() {
+            return dev;
+        }
     }
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("Lumen")

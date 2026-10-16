@@ -22,5 +22,8 @@ features = [
   "Win32_UI_WindowsAndMessaging",
 ]
 
+[features]
+dev-logs = []
+
 [dependencies]
 windows-core = "0.58"

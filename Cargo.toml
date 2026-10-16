@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lumen", "crates/lumen-tap", "crates/lumen-bar"]
+members = ["crates/lumen", "crates/lumen-tap", "crates/lumen-bar", "crates/lumen-setup"]
 default-members = ["crates/lumen", "crates/lumen-tap"]
 
 [profile.release]

@@ -187,7 +187,7 @@ fn tree() -> MutexGuard<'static, Tree> {
 fn log(msg: &str) {
     use std::io::Write;
     let dev = std::path::PathBuf::from(r"C:\Main\Lumen\lumen-logs");
-    let dir = if dev.is_dir() {
+    let dir = if cfg!(feature = "dev-logs") && dev.is_dir() {
         dev
     } else {
         let Some(base) = std::env::var_os("LOCALAPPDATA") else { return };
