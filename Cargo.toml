@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/lumen", "crates/lumen-tap", "crates/lumen-bar", "crates/lumen-setup"]
+default-members = ["crates/lumen", "crates/lumen-tap"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Unwind (not abort) so the Explorer helper can catch a panic instead of taking Explorer down.
+panic = "unwind"
