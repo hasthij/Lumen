@@ -66,6 +66,8 @@ pub struct View<'a> {
     pub selected: usize,
     pub hover: Option<usize>,
     pub button_focus: Option<usize>,
+    /// An action button is being clicked (mouse down, or the brief flash before it runs).
+    pub button_pressed: Option<usize>,
     pub confirming: bool,
     pub chip: Option<&'a str>,
     pub message: Option<&'a str>,
@@ -416,9 +418,17 @@ impl Renderer {
             for (bi, action) in item.secondary.iter().take(4).enumerate() {
                 let r = button_rect(row, bi, buttons);
                 let focused = v.button_focus == Some(bi);
-                brush.SetColor(&rgba(1.0, 1.0, 1.0, if focused { 0.16 } else { 0.06 }));
+                let pressed = v.button_pressed == Some(bi);
+                // Pressed: the button sinks a little and fills with the accent colour.
+                let r = if pressed { D2D_RECT_F { left: r.left + 2.0, top: r.top + 2.0, right: r.right - 2.0, bottom: r.bottom - 2.0 } } else { r };
+                if pressed {
+                    let [ar, ag, ab] = v.theme.accent;
+                    brush.SetColor(&rgba(ar, ag, ab, 0.5));
+                } else {
+                    brush.SetColor(&rgba(1.0, 1.0, 1.0, if focused { 0.16 } else { 0.06 }));
+                }
                 t.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 6.0, radiusY: 6.0 }, brush);
-                if focused {
+                if focused || pressed {
                     let [ar, ag, ab] = v.theme.accent;
                     brush.SetColor(&rgba(ar, ag, ab, 1.0));
                     t.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 6.0, radiusY: 6.0 }, brush, 1.0, None);

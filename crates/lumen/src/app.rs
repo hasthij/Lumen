@@ -509,6 +509,7 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_HOTKEY => {
+                crate::info!("shortcut pressed");
                 if wp.0 as i32 == HOTKEY_LAUNCHER {
                     if let Some(l) = self.launcher.as_mut() {
                         l.toggle(true);
@@ -653,8 +654,16 @@ unsafe fn create_window() -> Result<HWND> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if let Some(Some(r)) = with_app(|app| app.handle(msg, wp, lp)) {
-        return r;
+    match with_app(|app| app.handle(msg, wp, lp)) {
+        Some(Some(r)) => return r,
+        // The app was busy with another message (re-entrancy). A dropped shortcut press would
+        // look like the keybind "stopped working", so queue it again.
+        None if msg == WM_HOTKEY => {
+            crate::warn!("shortcut arrived while Lumen was busy; retrying");
+            let _ = PostMessageW(hwnd, msg, wp, lp);
+            return LRESULT(0);
+        }
+        _ => {}
     }
     if msg == WM_DESTROY {
         PostQuitMessage(0);

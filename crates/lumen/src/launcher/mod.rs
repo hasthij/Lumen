@@ -46,6 +46,7 @@ pub const WM_ICONS_READY: u32 = WM_APP + 22;
 const TIMER_CARET: usize = 1;
 const TIMER_SEARCH: usize = 2;
 const TIMER_RELEASE: usize = 3;
+const TIMER_FLASH: usize = 4;
 
 pub struct Launcher {
     hwnd: HWND,
@@ -65,6 +66,9 @@ pub struct Launcher {
     first: usize,
     hover: Option<usize>,
     button_focus: Option<usize>,
+    /// (row, button) under the mouse button right now, or flashing before its action runs.
+    pressed: Option<(usize, usize)>,
+    pending_action: Option<Action>,
     confirm_key: Option<String>,
     windows: Vec<OpenWindow>,
     visible: bool,
@@ -100,6 +104,8 @@ impl Launcher {
             first: 0,
             hover: None,
             button_focus: None,
+            pressed: None,
+            pending_action: None,
             confirm_key: None,
             windows: Vec::new(),
             visible: false,
@@ -126,6 +132,12 @@ impl Launcher {
     }
 
     pub fn toggle(&mut self, from_hotkey: bool) {
+        crate::info!("launcher toggle: flag visible={}, window visible={}", self.visible, unsafe { IsWindowVisible(self.hwnd).as_bool() });
+        // If the flag and the real window disagree (an animation failed, focus was stolen),
+        // trust the window so the shortcut always does the obvious thing.
+        if self.visible && !unsafe { IsWindowVisible(self.hwnd).as_bool() } {
+            self.visible = false;
+        }
         if self.visible {
             self.hide();
         } else {
@@ -157,8 +169,8 @@ impl Launcher {
             let x = wa.left + ((wa.right - wa.left) - w as i32) / 2;
             let y = wa.top + ((wa.bottom - wa.top) as f32 * 0.2) as i32;
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w as i32, h as i32, SWP_NOACTIVATE);
-            // A short fade in (120 ms, no extra frames from us; Windows does the blending).
-            let _ = AnimateWindow(self.hwnd, 120, AW_BLEND);
+            // Windows does the animating (no frames from us), so it costs next to nothing.
+            self.animate(false);
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(self.hwnd);
             let _ = KillTimer(self.hwnd, TIMER_RELEASE);
@@ -167,6 +179,33 @@ impl Launcher {
         self.visible = true;
         self.caret_on = true;
         self.redraw();
+    }
+
+    /// Plays the chosen open/close animation. If Windows refuses (some drivers do), the window
+    /// is simply shown without it, so the launcher can never end up hidden by a failed effect.
+    fn animate(&self, closing: bool) {
+        use windows::Win32::UI::WindowsAndMessaging::{AW_CENTER, AW_HIDE, AW_SLIDE, AW_VER_NEGATIVE, AW_VER_POSITIVE, AW_BLEND};
+        let ms = self.cfg.animation_ms;
+        let base = match self.cfg.animation.as_str() {
+            "none" => None,
+            "slide_up" => Some(AW_SLIDE | AW_VER_NEGATIVE),
+            "slide_down" => Some(AW_SLIDE | AW_VER_POSITIVE),
+            "zoom" => Some(AW_CENTER | AW_BLEND),
+            _ => Some(AW_BLEND),
+        };
+        unsafe {
+            let ok = match base {
+                Some(flags) if ms > 0 => {
+                    // Closing is a little quicker than opening.
+                    let flags = if closing { flags | AW_HIDE } else { flags };
+                    AnimateWindow(self.hwnd, if closing { ms * 2 / 3 } else { ms }, flags).is_ok()
+                }
+                _ => false,
+            };
+            if !ok && !closing {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
     }
 
     pub fn hide(&mut self) {
@@ -178,7 +217,7 @@ impl Launcher {
         self.button_focus = None;
         self.hover = None;
         unsafe {
-            let _ = AnimateWindow(self.hwnd, 90, AW_HIDE | AW_BLEND);
+            self.animate(true);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             let _ = KillTimer(self.hwnd, TIMER_CARET);
             SetTimer(self.hwnd, TIMER_RELEASE, 20_000, None);
@@ -513,6 +552,7 @@ impl Launcher {
             selected: self.selected,
             hover: self.hover,
             button_focus: self.button_focus,
+            button_pressed: self.pressed.filter(|(r, _)| self.first + r == self.selected).map(|(_, b)| b),
             confirming: self.confirm_key.is_some(),
             chip,
             message: message.as_deref(),
@@ -579,8 +619,22 @@ impl Launcher {
                 self.hover = None;
                 self.redraw();
             }
+            WM_LBUTTONDOWN => {
+                let (x, y) = self.mouse_pos(lp);
+                if let Some(row) = ui::row_at(y, self.rows()) {
+                    let i = self.first + row;
+                    if i == self.selected {
+                        let n = self.items[i].secondary.len().min(4);
+                        if let Some(b) = ui::button_at(x, y, row, n) {
+                            self.pressed = Some((row, b));
+                            self.redraw();
+                        }
+                    }
+                }
+            }
             WM_LBUTTONUP => {
                 let (x, y) = self.mouse_pos(lp);
+                let pressed = self.pressed;
                 if let Some(row) = ui::row_at(y, self.rows()) {
                     let i = self.first + row;
                     let was_selected = i == self.selected;
@@ -588,10 +642,21 @@ impl Launcher {
                     let item = self.items[i].clone();
                     let n = item.secondary.len().min(4);
                     match ui::button_at(x, y, row, n).filter(|_| was_selected) {
-                        Some(b) => self.run(item.secondary[b].clone()),
+                        Some(b) if pressed == Some((row, b)) => {
+                            // Keep the pressed look for a beat so the click is visibly acknowledged.
+                            self.pending_action = Some(item.secondary[b].clone());
+                            self.redraw();
+                            unsafe {
+                                SetTimer(self.hwnd, TIMER_FLASH, 110, None);
+                            }
+                            return Some(LRESULT(0));
+                        }
+                        Some(_) => {}
                         None => self.run(item.primary.clone()),
                     }
                 }
+                self.pressed = None;
+                self.redraw();
             }
             WM_MOUSEWHEEL => {
                 let delta = (wp.0 >> 16) as i16;
@@ -606,6 +671,13 @@ impl Launcher {
                     let _ = KillTimer(self.hwnd, TIMER_SEARCH);
                     if let Some(jobs) = self.pending.take() {
                         self.worker.submit(self.gen, jobs);
+                    }
+                },
+                TIMER_FLASH => unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_FLASH);
+                    self.pressed = None;
+                    if let Some(a) = self.pending_action.take() {
+                        self.run(a);
                     }
                 },
                 TIMER_RELEASE => unsafe {
@@ -688,6 +760,7 @@ impl Launcher {
             selected: self.selected,
             hover: None,
             button_focus: None,
+            button_pressed: None,
             confirming: false,
             chip,
             message: message.as_deref(),

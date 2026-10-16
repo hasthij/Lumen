@@ -144,6 +144,10 @@ pub struct LauncherConfig {
     pub ignore_in_fullscreen: bool,
     /// Launcher size multiplier on top of the display scaling (1.0 = normal).
     pub scale: f32,
+    /// Open/close animation: "none", "fade", "slide_up", "slide_down" or "zoom".
+    pub animation: String,
+    /// Animation length in milliseconds (kept short so it never feels slow).
+    pub animation_ms: u32,
     /// Always offer "search the web" as the last result for what you typed.
     pub web_fallback: bool,
     /// A preset id from `ENGINES`, or "custom" to use `search_url`.
@@ -195,6 +199,8 @@ impl Default for LauncherConfig {
             max_results: 6,
             ignore_in_fullscreen: true,
             scale: 1.0,
+            animation: "fade".into(),
+            animation_ms: 140,
             web_fallback: true,
             search_engine: "google".into(),
             search_url: String::new(),
@@ -215,6 +221,7 @@ impl LauncherConfig {
         }
         self.max_results = self.max_results.clamp(1, 12);
         self.scale = self.scale.clamp(0.7, 2.0);
+        self.animation_ms = self.animation_ms.clamp(0, 400);
     }
 
     pub fn plugin(&self, id: &str) -> Option<&PluginSetting> {

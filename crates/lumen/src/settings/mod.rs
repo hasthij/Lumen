@@ -77,6 +77,7 @@ enum Slider {
     ClockSize,
     ClockOpacity,
     LauncherScale,
+    AnimSpeed,
     ClockHue,
     ClockSat,
     TbOpacity(Sit),
@@ -101,6 +102,7 @@ enum Hit {
     OpenConfig,
     OpenSkins,
     WebFallback,
+    Animation(&'static str),
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -306,6 +308,7 @@ impl Settings {
             Slider::ClockSize => (self.cfg.clock.size - 0.5) / 2.0,
             Slider::ClockOpacity => (self.cfg.clock.opacity - 0.1) / 0.9,
             Slider::LauncherScale => (self.cfg.launcher.scale - 0.7) / 1.3,
+            Slider::AnimSpeed => self.cfg.launcher.animation_ms as f32 / 400.0,
             Slider::ClockHue => hsv_of(&self.cfg.clock.color, [1.0; 3]).0 / 360.0,
             Slider::ClockSat => hsv_of(&self.cfg.clock.color, [1.0; 3]).1,
             Slider::TbOpacity(s) => self.look(s).opacity,
@@ -329,6 +332,7 @@ impl Settings {
             Slider::ClockSize => self.cfg.clock.size = ((0.5 + t * 2.0) * 20.0).round() / 20.0,
             Slider::ClockOpacity => self.cfg.clock.opacity = ((0.1 + t * 0.9) * 100.0).round() / 100.0,
             Slider::LauncherScale => self.cfg.launcher.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
+            Slider::AnimSpeed => self.cfg.launcher.animation_ms = ((t * 400.0 / 10.0).round() * 10.0) as u32,
             Slider::ClockHue | Slider::ClockSat => {
                 let (h, sat, _) = hsv_of(&self.cfg.clock.color, [1.0; 3]);
                 let (h, sat) = if s == Slider::ClockHue { (t * 360.0, sat.max(0.35)) } else { (h, t) };
@@ -349,6 +353,7 @@ impl Settings {
             Slider::ClockSize => format!("{}%", (self.cfg.clock.size * 100.0).round()),
             Slider::ClockOpacity => format!("{}%", (self.cfg.clock.opacity * 100.0).round()),
             Slider::LauncherScale => format!("{}%", (self.cfg.launcher.scale * 100.0).round()),
+            Slider::AnimSpeed => format!("{} ms", self.cfg.launcher.animation_ms),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -394,6 +399,10 @@ impl Settings {
                     "taskbar" => self.cfg.modules.taskbar = !self.cfg.modules.taskbar,
                     _ => {}
                 }
+                self.commit_config();
+            }
+            Hit::Animation(id) => {
+                self.cfg.launcher.animation = id.into();
                 self.commit_config();
             }
             Hit::WebFallback => {
@@ -1218,6 +1227,18 @@ impl Settings {
         let v = self.slider_label(Slider::LauncherScale);
         self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::LauncherScale, None);
         self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+        y += 72.0;
+
+        self.card(y, 68.0, Some(('\u{E7AC}', None)), "Animation", "How the launcher appears and disappears");
+        let styles: [(&'static str, &str); 5] = [("none", "None"), ("fade", "Fade"), ("slide_up", "Slide up"), ("slide_down", "Slide down"), ("zoom", "Zoom")];
+        let opts: Vec<(&str, Hit)> = styles.iter().map(|(id, name)| (*name, Hit::Animation(id))).collect();
+        let sel = styles.iter().position(|(id, _)| *id == self.cfg.launcher.animation).unwrap_or(1);
+        self.segmented(right, y + 34.0, &opts, sel);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E916}', None)), "Animation speed", "Shorter is snappier; 0 turns the animation off");
+        let v = self.slider_label(Slider::AnimSpeed);
+        self.slider(RIGHT - 366.0, y + 34.0, 300.0, Slider::AnimSpeed, None);
+        self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
         y += 72.0;
 
         self.card(y, 68.0, Some(('\u{E774}', None)), "Search the web", "Last result for anything you type; opens your default browser");

@@ -19,8 +19,10 @@ pub const APPS_FOLDER: &str = r"shell:AppsFolder\";
 /// Runs an action. Returns false when it could not be started.
 pub fn run(action: &Action, owner: HWND) -> bool {
     match action {
-        Action::Open { target, args } => execute("open", target, args, None),
-        Action::RunAsAdmin { target, args } | Action::Elevated { target, args, .. } => execute("runas", target, args, None),
+        // Launching can wait on a UAC prompt or a slow program. Doing that on the UI thread
+        // would freeze Lumen (and drop the global shortcut) until it finishes, so it runs aside.
+        Action::Open { target, args } => spawn_execute("open", target.clone(), args.clone()),
+        Action::RunAsAdmin { target, args } | Action::Elevated { target, args, .. } => spawn_execute("runas", target.clone(), args.clone()),
         Action::ShowInFolder(path) => show_in_folder(path),
         Action::Copy(text) => copy(owner, text),
         Action::Terminal(dir) => terminal(dir),
@@ -29,6 +31,21 @@ pub fn run(action: &Action, owner: HWND) -> bool {
         Action::System(cmd) => system(*cmd),
         Action::RegistryOpen(key) => open_regedit(key),
     }
+}
+
+fn spawn_execute(verb: &'static str, target: String, args: String) -> bool {
+    std::thread::Builder::new()
+        .name("lumen-launch".into())
+        .spawn(move || {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            if !execute(verb, &target, &args, None) {
+                crate::warn!("action failed: {verb} {target}");
+            }
+        })
+        .is_ok()
 }
 
 pub fn execute(verb: &str, target: &str, args: &str, dir: Option<&str>) -> bool {
