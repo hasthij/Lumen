@@ -157,6 +157,7 @@ fn make_shortcut(target: &Path, link: &Path) {
             let _ = l.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()));
         }
         let _ = l.SetArguments(w!("--settings"));
+        let _ = l.SetIconLocation(&HSTRING::from(target.as_os_str()), 0);
         let _ = l.SetDescription(w!("Lumen: desktop clock, launcher and clear taskbar"));
         if let Ok(file) = l.cast::<IPersistFile>() {
             if let Some(parent) = link.parent() {
