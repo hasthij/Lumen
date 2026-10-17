@@ -28,6 +28,7 @@ const RIGHT: f32 = CONTENT_X + CONTENT_W - 18.0;
 const TIMER_CARET: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_ANIM: usize = 3;
+const TIMER_NOTICE: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -184,6 +185,8 @@ pub struct Settings {
     /// The skin whose options are shown below the library.
     selected: Option<String>,
     animating: bool,
+    /// Short confirmation shown next to a button ("Reloaded"), cleared by a timer.
+    notice: Option<String>,
     /// Page fade-in progress, 0 to 1.
     page_fade: f32,
 }
@@ -242,6 +245,7 @@ impl Settings {
             expanded: std::collections::HashSet::new(),
             selected: None,
             animating: false,
+            notice: None,
             page_fade: 1.0,
         }
     }
@@ -597,7 +601,13 @@ impl Settings {
                 self.cfg.modules.taskbar = false;
                 self.changes.push(Change::RestartExplorer);
             }
-            Hit::ReloadSkin => self.changes.push(Change::ReloadSkin),
+            Hit::ReloadSkin => {
+                self.changes.push(Change::ReloadSkin);
+                self.notice = Some("Reloaded".into());
+                unsafe {
+                    SetTimer(self.hwnd, TIMER_NOTICE, 2500, None);
+                }
+            }
             Hit::OpenLog => open(&crate::log::dir().display().to_string()),
             Hit::OpenConfig => open(&crate::config::path().display().to_string()),
             Hit::OpenSkins => {
@@ -837,6 +847,13 @@ impl Settings {
             WM_TIMER => {
                 if wp.0 == TIMER_CARET {
                     self.caret_on = !self.caret_on;
+                    self.redraw();
+                }
+                if wp.0 == TIMER_NOTICE {
+                    self.notice = None;
+                    unsafe {
+                        let _ = KillTimer(self.hwnd, TIMER_NOTICE);
+                    }
                     self.redraw();
                 }
                 if wp.0 == TIMER_ANIM {
@@ -1321,7 +1338,12 @@ impl Settings {
         self.button(x - 8.0, y + 34.0, "Reset all", Hit::ResetClock);
         y += 72.0;
         self.card(y, 68.0, Some(('\u{E72C}', None)), "Reload skins", "Edits to skin files also reload on their own within a minute");
-        self.button(RIGHT, y + 34.0, "Reload", Hit::ReloadSkin);
+        let x = self.button(RIGHT, y + 34.0, "Reload", Hit::ReloadSkin);
+        if let Some(note) = self.notice.clone() {
+            // A green check and the word, to the left of the button.
+            self.canvas.glyph('\u{E73E}', Rect::new(x - 110.0, y + 22.0, 24.0, 24.0), 14.0, rgba(0.42, 0.85, 0.55, 1.0));
+            self.canvas.text(&note, Rect::new(x - 84.0, y + 22.0, 76.0, 24.0), Font::Text, 13.0, 500, rgba(0.42, 0.85, 0.55, 1.0), Align::Left);
+        }
         y + 68.0
     }
 
