@@ -13,6 +13,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::clock::Clock;
+use crate::config::ClockConfig;
 use crate::config::Config;
 use crate::launcher::Launcher;
 use crate::settings::{Change, Settings, Status};
@@ -77,7 +78,8 @@ thread_local! {
 pub struct App {
     hwnd: HWND,
     cfg: Config,
-    clock: Option<Clock>,
+    /// One window per skin that is switched on.
+    skins: Vec<Clock>,
     launcher: Option<Launcher>,
     settings: Option<Settings>,
     taskbar: Option<Taskbar>,
@@ -99,7 +101,7 @@ pub fn run(open_settings: bool) -> Result<()> {
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
     };
     let cfg = Config::load();
-    let app = App { hwnd, cfg, clock: None, launcher: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
+    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| {
         app.add_tray();
@@ -150,24 +152,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 impl App {
     fn apply_modules(&mut self) {
-        match (self.cfg.modules.clock, self.clock.is_some()) {
-            (true, false) => match Clock::create(&self.cfg.clock) {
-                Ok(c) => {
-                    self.clock = Some(c);
-                    self.clock_tick(true);
-                    crate::info!("clock module on");
-                }
-                Err(e) => crate::error!("clock module failed to start: {e}"),
-            },
-            (false, true) => {
-                self.clock = None;
-                unsafe {
-                    let _ = KillTimer(self.hwnd, TIMER_CLOCK);
-                }
-                crate::info!("clock module off");
-            }
-            _ => {}
-        }
+        self.sync_skins();
         match (self.cfg.modules.taskbar, self.taskbar.is_some()) {
             (true, false) => {
                 self.taskbar_note.clear();
@@ -204,11 +189,46 @@ impl App {
         self.schedule_trim();
     }
 
+    /// Makes the skin windows match the config: windows for skins that were switched on,
+    /// settings pushed to ones already running, windows closed for skins switched off.
+    fn sync_skins(&mut self) {
+        let want: Vec<ClockConfig> = if self.cfg.modules.clock { self.cfg.skins.iter().filter(|s| s.enabled).cloned().collect() } else { Vec::new() };
+        self.skins.retain(|c| want.iter().any(|w| w.skin.eq_ignore_ascii_case(c.rel())));
+        let root = self.cfg.clock.skins_path.clone();
+        for w in &want {
+            match self.skins.iter_mut().find(|c| c.rel().eq_ignore_ascii_case(&w.skin)) {
+                Some(c) => c.apply_config(w),
+                None => match Clock::create(w, &root) {
+                    Ok(c) => {
+                        crate::info!("skin on: {}", w.skin);
+                        self.skins.push(c);
+                    }
+                    Err(e) => crate::error!("skin {} failed to start: {e}", w.skin),
+                },
+            }
+        }
+        if self.skins.is_empty() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_CLOCK);
+            }
+        } else {
+            self.clock_tick(true);
+        }
+    }
+
     pub fn status(&self) -> Status {
         Status {
             hotkey_ok: self.hotkey_ok,
-            clock_ok: self.clock.as_ref().is_some_and(|c| c.has_skin()),
-            skin: self.cfg.clock.skin.clone(),
+            skins_running: self.skins.iter().filter(|c| c.has_skin()).count(),
+            skin_notes: self
+                .skins
+                .iter()
+                .map(|c| {
+                    let un = c.unsupported();
+                    let note = if !c.has_skin() { "Couldn't be read. Check the log".to_string() } else if un.is_empty() { String::new() } else { format!("Not drawn yet: {}", un.join(", ")) };
+                    (c.rel().to_string(), note)
+                })
+                .collect(),
             memory_mb: memory_mb(),
             autostart: crate::autostart::enabled(),
             apps: self.launcher.as_ref().map_or(0, |l| l.app_count()),
@@ -221,7 +241,7 @@ impl App {
                 None => "Off".into(),
             },
             translucenttb: crate::taskbar::translucenttb_running(),
-            clock_moving: self.clock.as_ref().is_some_and(|c| c.moving()),
+            moving_skin: self.skins.iter().find(|c| c.moving()).map(|c| c.rel().to_string()).unwrap_or_default(),
             skins_dir: if self.cfg.clock.skins_path.is_empty() {
                 crate::rainmeter::Install::locate().skins.map(|p| p.display().to_string()).unwrap_or_default()
             } else {
@@ -245,10 +265,6 @@ impl App {
             self.cfg.save();
         }
         self.apply_modules();
-        if let Some(c) = self.clock.as_mut() {
-            c.apply_config(&self.cfg.clock);
-        }
-        self.clock_tick(true);
         if let Some(l) = self.launcher.as_mut() {
             l.set_config(&self.cfg.launcher, &self.cfg.appearance);
         }
@@ -310,8 +326,9 @@ impl App {
             match change {
                 Change::Config(cfg) => self.apply_config(*cfg, true),
                 Change::Preview(cfg) => self.apply_config(*cfg, false),
-                Change::MoveClock(on) => {
-                    if let Some(c) = self.clock.as_mut() {
+                Change::MoveSkin(which) => {
+                    for c in self.skins.iter_mut() {
+                        let on = which.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(c.rel()));
                         c.set_moving(on);
                     }
                     self.clock_tick(true);
@@ -328,7 +345,7 @@ impl App {
                     crate::autostart::set(on);
                 }
                 Change::ReloadSkin => {
-                    if let Some(c) = self.clock.as_mut() {
+                    for c in self.skins.iter_mut() {
                         c.reload();
                     }
                     self.clock_tick(true);
@@ -381,8 +398,11 @@ impl App {
     }
 
     fn clock_tick(&mut self, force: bool) {
-        let Some(clock) = self.clock.as_mut() else { return };
-        let delay = clock.tick(force);
+        if self.skins.is_empty() {
+            return;
+        }
+        // One timer for all skins: wake when the soonest one needs a redraw.
+        let delay = self.skins.iter_mut().map(|c| c.tick(force)).min().unwrap_or(30_000);
         unsafe {
             // Coalescable: lets Windows batch our wake-up with others to save power.
             SetCoalescableTimer(self.hwnd, TIMER_CLOCK, delay, None, 30);
@@ -434,7 +454,7 @@ impl App {
                 let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_LAUNCHER, w!("Open launcher"));
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.clock), CMD_CLOCK, w!("Clock"));
+            let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.clock), CMD_CLOCK, w!("Skins"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.launcher), CMD_LAUNCHER, w!("Launcher"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.taskbar), CMD_TASKBAR, w!("Clear taskbar"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -482,7 +502,7 @@ impl App {
                 }
             }
             CMD_RELOAD => {
-                if let Some(c) = self.clock.as_mut() {
+                for c in self.skins.iter_mut() {
                     c.reload();
                 }
                 self.clock_tick(true);
@@ -525,19 +545,25 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_CLOCK_MOVED => {
-                if let Some(c) = self.clock.as_mut() {
-                    let (x, y) = c.read_position();
-                    self.cfg.clock.x = Some(x);
-                    self.cfg.clock.y = Some(y);
+                // The window that was dragged says who it is (wParam), so every skin keeps its own spot.
+                let h = wp.0 as isize;
+                let moved = self.skins.iter_mut().find(|c| c.hwnd().0 as isize == h).map(|c| (c.rel().to_string(), c.read_position()));
+                if let Some((rel, (x, y))) = moved {
+                    if let Some(s) = self.cfg.skin_mut(&rel) {
+                        s.x = Some(x);
+                        s.y = Some(y);
+                    }
                     self.cfg.save();
-                    crate::info!("clock moved to {x},{y}");
+                    crate::info!("{rel} moved to {x},{y}");
                 }
                 self.sync_settings();
                 Some(LRESULT(0))
             }
             WM_FOREGROUND => {
-                if let (Some(front), Some(c)) = (desktop_in_front(), self.clock.as_mut()) {
-                    c.set_desktop_in_front(front);
+                if let Some(front) = desktop_in_front() {
+                    for c in self.skins.iter_mut() {
+                        c.set_desktop_in_front(front);
+                    }
                 }
                 Some(LRESULT(0))
             }

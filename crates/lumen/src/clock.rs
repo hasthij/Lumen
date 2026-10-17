@@ -38,9 +38,10 @@ pub struct Clock {
 }
 
 impl Clock {
-    pub fn create(cfg: &ClockConfig) -> Result<Self> {
+    /// One window for one skin. `skins_path` overrides where Rainmeter's Skins folder is.
+    pub fn create(cfg: &ClockConfig, skins_path: &str) -> Result<Self> {
         let install = Install::locate();
-        let skins_root = if cfg.skins_path.is_empty() { install.skins.clone() } else { Some(PathBuf::from(&cfg.skins_path)) };
+        let skins_root = if skins_path.is_empty() { install.skins.clone() } else { Some(PathBuf::from(skins_path)) };
         let config_name = config_name(&cfg.skin);
         let saved = install.window_pos(&config_name);
         let pos = POINT { x: cfg.x.or(saved.map(|p| p.0)).unwrap_or(100), y: cfg.y.or(saved.map(|p| p.1)).unwrap_or(100) };
@@ -173,6 +174,20 @@ impl Clock {
 
     pub fn moving(&self) -> bool {
         self.moving
+    }
+
+    /// The skin this window shows, as `Config\\File.ini`.
+    pub fn rel(&self) -> &str {
+        &self.rel
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// Meters and measures the skin uses that Lumen can't draw yet.
+    pub fn unsupported(&self) -> Vec<String> {
+        self.skin.as_ref().map(|s| s.unsupported.clone()).unwrap_or_default()
     }
 
     /// After a drag: reads where the window ended up, in skin pixels.
@@ -388,7 +403,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_EXITSIZEMOVE => {
             if let Ok(app) = FindWindowW(w!("LumenApp"), None) {
-                let _ = PostMessageW(app, crate::app::WM_CLOCK_MOVED, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(app, crate::app::WM_CLOCK_MOVED, WPARAM(hwnd.0 as usize), LPARAM(0));
             }
             LRESULT(0)
         }

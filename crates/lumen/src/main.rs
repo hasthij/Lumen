@@ -55,7 +55,7 @@ fn main() {
     }
     if let Some(i) = args.iter().position(|a| a == "--settings-snapshot") {
         let page = match args.get(i + 1).map(String::as_str) {
-            Some("clock") => settings::Page::Clock,
+            Some("clock") | Some("skins") => settings::Page::Skins,
             Some("appearance") => settings::Page::Appearance,
             Some("taskbar") => settings::Page::Taskbar,
             Some("launcher") => settings::Page::Launcher,
@@ -66,14 +66,14 @@ fn main() {
         let cfg = config::Config::load();
         let status = settings::Status {
             hotkey_ok: true,
-            clock_ok: true,
-            skin: cfg.clock.skin.clone(),
+            skins_running: 1,
+            skin_notes: vec![(r"Summit\Time\Time.ini".to_string(), String::new())],
             memory_mb: 12.3,
             autostart: autostart::enabled(),
             apps: 342,
             taskbar: "Connected · clear (desktop)".into(),
             translucenttb: taskbar::translucenttb_running(),
-            clock_moving: false,
+            moving_skin: String::new(),
             skins_dir: rainmeter::Install::locate().skins.map(|p| p.display().to_string()).unwrap_or_default(),
         };
         std::process::exit(match settings::snapshot(&cfg, status, page) {
@@ -161,7 +161,8 @@ fn launcher_snapshot(q: &str, out: &str) -> i32 {
 /// Writes the clock frame as a 32-bit BMP over a dark background.
 fn snapshot(out: &str) -> i32 {
     let cfg = config::Config::load();
-    let Ok(mut clock) = clock::Clock::create(&cfg.clock) else { return 1 };
+    let Some(first) = cfg.skins.iter().find(|s| s.enabled) else { return 1 };
+    let Ok(mut clock) = clock::Clock::create(first, &cfg.clock.skins_path) else { return 1 };
     let Some((w, h, px)) = clock.snapshot() else { return 2 };
     write_bmp(out, w, h, &px)
 }

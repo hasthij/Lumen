@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub modules: Modules,
+    /// Legacy single-skin settings. Only `skins_path` is still used; the skin itself
+    /// moves into `skins` the first time an older config is loaded.
     pub clock: ClockConfig,
+    /// Every skin Lumen knows about, with its own position and look. `enabled` is the switch.
+    pub skins: Vec<ClockConfig>,
     pub launcher: LauncherConfig,
     pub appearance: Appearance,
     pub taskbar: TaskbarConfig,
@@ -29,6 +33,8 @@ pub struct Modules {
 pub struct ClockConfig {
     /// Rainmeter skin to render, as `Config\File.ini` under the Skins folder.
     pub skin: String,
+    /// Shown on the desktop. Turned-off skins keep their position and look.
+    pub enabled: bool,
     /// Skins folder. Empty means "read SkinPath from Rainmeter.ini".
     pub skins_path: String,
     /// Window position in skin (96-DPI) pixels. `None` means "use Rainmeter.ini's WindowX/WindowY".
@@ -106,6 +112,7 @@ impl Default for Config {
         Self {
             modules: Modules::default(),
             clock: ClockConfig::default(),
+            skins: Vec::new(),
             launcher: LauncherConfig::default(),
             appearance: Appearance::default(),
             taskbar: TaskbarConfig::default(),
@@ -119,10 +126,18 @@ impl Default for Modules {
     }
 }
 
+impl ClockConfig {
+    /// Defaults for a skin turned on from the library: nothing overridden, the skin's own look.
+    pub fn fresh() -> Self {
+        Self { skin: String::new(), ..Self::default() }
+    }
+}
+
 impl Default for ClockConfig {
     fn default() -> Self {
         Self {
             skin: r"Summit\Time\Time.ini".into(),
+            enabled: true,
             skins_path: String::new(),
             x: None,
             y: None,
@@ -257,6 +272,7 @@ impl Config {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(mut cfg) => {
                     cfg.launcher.fill_defaults();
+                    cfg.migrate_skins(&text);
                     cfg
                 }
                 Err(e) => {
@@ -270,6 +286,37 @@ impl Config {
                 cfg.save();
                 cfg
             }
+        }
+    }
+
+    /// Older configs had one `[clock]` skin. Move it into the skin list once.
+    fn migrate_skins(&mut self, text: &str) {
+        let has_list = text.contains("[[skins]]");
+        if !has_list && self.skins.is_empty() && !self.clock.skin.is_empty() {
+            let mut first = self.clock.clone();
+            first.skins_path.clear();
+            self.skins.push(first);
+            crate::info!("moved the clock skin into the skin list");
+        }
+        // The legacy block now only carries the skins folder override.
+        self.clock.skin.clear();
+        self.skins.dedup_by(|a, b| a.skin.eq_ignore_ascii_case(&b.skin));
+    }
+
+    pub fn skin_mut(&mut self, rel: &str) -> Option<&mut ClockConfig> {
+        self.skins.iter_mut().find(|s| s.skin.eq_ignore_ascii_case(rel))
+    }
+
+    pub fn skin(&self, rel: &str) -> Option<&ClockConfig> {
+        self.skins.iter().find(|s| s.skin.eq_ignore_ascii_case(rel))
+    }
+
+    /// Switches a skin on or off, adding it to the list the first time it is turned on.
+    pub fn set_skin_enabled(&mut self, rel: &str, on: bool) {
+        if let Some(s) = self.skin_mut(rel) {
+            s.enabled = on;
+        } else if on {
+            self.skins.push(ClockConfig { skin: rel.to_string(), ..ClockConfig::fresh() });
         }
     }
 

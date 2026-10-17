@@ -71,6 +71,8 @@ pub struct Skin {
     /// Files whose change should trigger a reload, with the mtime seen at load.
     watched: Vec<(PathBuf, Option<SystemTime>)>,
     pub needs_seconds: bool,
+    /// Meters and measures this skin uses that Lumen doesn't draw yet (short names).
+    pub unsupported: Vec<String>,
 }
 
 impl Skin {
@@ -102,6 +104,7 @@ impl Skin {
             meters: Vec::new(),
             watched: vec![(file.clone(), mtime(&file))],
             needs_seconds: false,
+            unsupported: Vec::new(),
         };
 
         let mut sections = Vec::new();
@@ -135,6 +138,17 @@ impl Skin {
         }
         if !unsupported.is_empty() {
             crate::warn!("{rel}: not supported yet, skipped: {}", unsupported.join(", "));
+            // Short names for the settings page: "Meter=Image [x]" -> "Image".
+            let mut names: Vec<String> = unsupported
+                .iter()
+                .filter_map(|u| u.split('=').nth(1).and_then(|r| r.split(' ').next()).map(|n| {
+                    let mut c = n.chars();
+                    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+                }))
+                .collect();
+            names.sort();
+            names.dedup();
+            skin.unsupported = names;
         }
         Ok(skin)
     }
@@ -145,7 +159,13 @@ impl Skin {
             if section.name.eq_ignore_ascii_case("Variables") {
                 for (k, v) in &section.entries {
                     if k.to_ascii_lowercase().starts_with("@include") {
-                        let path = PathBuf::from(unquote(&self.expand(v)));
+                        let mut path = PathBuf::from(unquote(&self.expand(v)));
+                        // A bare file name is relative to the skin's own folder, as in Rainmeter.
+                        if path.is_relative() {
+                            if let Some(dir) = self.file.parent() {
+                                path = dir.join(path);
+                            }
+                        }
                         if depth < 8 && seen.insert(path.clone()) {
                             self.watched.push((path.clone(), mtime(&path)));
                             match Ini::load(&path) {

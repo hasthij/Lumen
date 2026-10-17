@@ -33,7 +33,7 @@ const TIMER_ANIM: usize = 3;
 pub enum Page {
     General,
     Appearance,
-    Clock,
+    Skins,
     Launcher,
     Taskbar,
     About,
@@ -42,7 +42,7 @@ pub enum Page {
 const PAGES: &[(Page, &str, char)] = &[
     (Page::General, "General", '\u{E80F}'),
     (Page::Appearance, "Appearance", '\u{E790}'),
-    (Page::Clock, "Clock", '\u{E823}'),
+    (Page::Skins, "Skins", '\u{E8B7}'),
     (Page::Launcher, "Launcher", '\u{E721}'),
     (Page::Taskbar, "Taskbar", '\u{E7C4}'),
     (Page::About, "About", '\u{E946}'),
@@ -111,6 +111,10 @@ enum Hit {
     Hour(Option<bool>),
     MoveClock,
     ResetClock,
+    Expand(String),
+    SkinToggle(String),
+    SelectSkin(String),
+    RefreshSkins,
     TbMode(Sit, &'static str),
     TbColor(Sit, u32),
     QuitTtb,
@@ -127,7 +131,8 @@ pub enum Change {
     ReloadSkin,
     /// Pause the global hotkey while the user records a new one.
     RecordingHotkey(bool),
-    MoveClock(bool),
+    /// Start (Some) or stop (None) dragging a skin on the desktop.
+    MoveSkin(Option<String>),
     QuitTranslucentTB,
     RestoreTaskbar,
     RestartExplorer,
@@ -137,14 +142,17 @@ pub enum Change {
 #[derive(Default, Clone)]
 pub struct Status {
     pub hotkey_ok: bool,
-    pub clock_ok: bool,
-    pub skin: String,
+    /// How many skin windows are running.
+    pub skins_running: usize,
+    /// Per running skin: its path and a note about what Lumen can't draw yet (empty = all good).
+    pub skin_notes: Vec<(String, String)>,
     pub memory_mb: f32,
     pub autostart: bool,
     pub apps: usize,
     pub taskbar: String,
     pub translucenttb: bool,
-    pub clock_moving: bool,
+    /// The skin being dragged right now, or empty.
+    pub moving_skin: String,
     /// Where Rainmeter's skins live (the Skins folder the clock reads from).
     pub skins_dir: String,
 }
@@ -171,6 +179,10 @@ pub struct Settings {
     backdrop: bool,
     /// Toggle knob positions (0 = off, 1 = on), eased toward their target each frame.
     anim: std::collections::HashMap<String, f32>,
+    tree: Vec<crate::rainmeter::Node>,
+    expanded: std::collections::HashSet<String>,
+    /// The skin whose options are shown below the library.
+    selected: Option<String>,
     animating: bool,
     /// Page fade-in progress, 0 to 1.
     page_fade: f32,
@@ -199,7 +211,9 @@ impl Settings {
             let _ = SetForegroundWindow(hwnd);
             SetTimer(hwnd, TIMER_STATUS, 2000, None);
         }
-        Ok(Self::new(hwnd, cfg, status, scale, backdrop))
+        let mut me = Self::new(hwnd, cfg, status, scale, backdrop);
+        me.refresh_library();
+        Ok(me)
     }
 
     fn new(hwnd: HWND, cfg: &Config, status: Status, scale: f32, backdrop: bool) -> Self {
@@ -224,9 +238,42 @@ impl Settings {
             theme: theme::resolve(&cfg.appearance),
             backdrop,
             anim: std::collections::HashMap::new(),
+            tree: Vec::new(),
+            expanded: std::collections::HashSet::new(),
+            selected: None,
             animating: false,
             page_fade: 1.0,
         }
+    }
+
+    /// Re-reads the Skins folder. Folders holding a running skin start expanded.
+    fn refresh_library(&mut self) {
+        let dir = std::path::PathBuf::from(&self.status.skins_dir);
+        self.tree = if self.status.skins_dir.is_empty() { Vec::new() } else { crate::rainmeter::scan(&dir) };
+        for sk in self.cfg.skins.iter().filter(|k| k.enabled) {
+            let mut path = String::new();
+            let parts: Vec<&str> = sk.skin.split('\\').collect();
+            for part in &parts[..parts.len().saturating_sub(1)] {
+                if !path.is_empty() {
+                    path.push('\\');
+                }
+                path.push_str(part);
+                self.expanded.insert(path.clone());
+            }
+        }
+        if self.selected.as_ref().map_or(true, |r| !self.cfg.skin(r).is_some_and(|k| k.enabled)) {
+            self.selected = self.cfg.skins.iter().find(|k| k.enabled).map(|k| k.skin.clone());
+        }
+    }
+
+    /// Settings of the selected skin (defaults when none is selected).
+    fn sel(&self) -> crate::config::ClockConfig {
+        self.selected.as_deref().and_then(|r| self.cfg.skin(r)).cloned().unwrap_or_default()
+    }
+
+    fn sel_mut(&mut self) -> Option<&mut crate::config::ClockConfig> {
+        let r = self.selected.clone()?;
+        self.cfg.skin_mut(&r)
     }
 
     pub fn focus(&self) {
@@ -305,12 +352,12 @@ impl Settings {
             Slider::Strength => self.cfg.appearance.strength,
             Slider::TintHue => hsv_of(&self.cfg.appearance.tint, [0.12; 3]).0 / 360.0,
             Slider::TintLight => hsv_of(&self.cfg.appearance.tint, [0.12; 3]).2 / 0.4,
-            Slider::ClockSize => (self.cfg.clock.size - 0.5) / 2.0,
-            Slider::ClockOpacity => (self.cfg.clock.opacity - 0.1) / 0.9,
+            Slider::ClockSize => (self.sel().size - 0.5) / 2.0,
+            Slider::ClockOpacity => (self.sel().opacity - 0.1) / 0.9,
             Slider::LauncherScale => (self.cfg.launcher.scale - 0.7) / 1.3,
             Slider::AnimSpeed => self.cfg.launcher.animation_ms as f32 / 400.0,
-            Slider::ClockHue => hsv_of(&self.cfg.clock.color, [1.0; 3]).0 / 360.0,
-            Slider::ClockSat => hsv_of(&self.cfg.clock.color, [1.0; 3]).1,
+            Slider::ClockHue => hsv_of(&self.sel().color, [1.0; 3]).0 / 360.0,
+            Slider::ClockSat => hsv_of(&self.sel().color, [1.0; 3]).1,
             Slider::TbOpacity(s) => self.look(s).opacity,
             Slider::TbHue(s) => hsv_of(&self.look(s).color, [0.0; 3]).0 / 360.0,
             Slider::TbLight(s) => hsv_of(&self.look(s).color, [0.0; 3]).2,
@@ -329,14 +376,24 @@ impl Settings {
                 self.cfg.appearance.tint = theme::to_hex(theme::hsv(h, 0.6, v));
                 self.cfg.appearance.theme = "custom".into();
             }
-            Slider::ClockSize => self.cfg.clock.size = ((0.5 + t * 2.0) * 20.0).round() / 20.0,
-            Slider::ClockOpacity => self.cfg.clock.opacity = ((0.1 + t * 0.9) * 100.0).round() / 100.0,
+            Slider::ClockSize => {
+                if let Some(c) = self.sel_mut() {
+                    c.size = ((0.5 + t * 2.0) * 20.0).round() / 20.0;
+                }
+            }
+            Slider::ClockOpacity => {
+                if let Some(c) = self.sel_mut() {
+                    c.opacity = ((0.1 + t * 0.9) * 100.0).round() / 100.0;
+                }
+            }
             Slider::LauncherScale => self.cfg.launcher.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
             Slider::AnimSpeed => self.cfg.launcher.animation_ms = ((t * 400.0 / 10.0).round() * 10.0) as u32,
             Slider::ClockHue | Slider::ClockSat => {
-                let (h, sat, _) = hsv_of(&self.cfg.clock.color, [1.0; 3]);
+                let (h, sat, _) = hsv_of(&self.sel().color, [1.0; 3]);
                 let (h, sat) = if s == Slider::ClockHue { (t * 360.0, sat.max(0.35)) } else { (h, t) };
-                self.cfg.clock.color = theme::to_hex(theme::hsv(h, sat, 1.0));
+                if let Some(c) = self.sel_mut() {
+                    c.color = theme::to_hex(theme::hsv(h, sat, 1.0));
+                }
             }
             Slider::TbOpacity(sit) => self.look_mut(sit).opacity = (t * 100.0).round() / 100.0,
             Slider::TbHue(sit) | Slider::TbLight(sit) => {
@@ -350,8 +407,8 @@ impl Settings {
     fn slider_label(&self, s: Slider) -> String {
         match s {
             Slider::Strength => format!("{}%", (self.cfg.appearance.strength * 100.0).round()),
-            Slider::ClockSize => format!("{}%", (self.cfg.clock.size * 100.0).round()),
-            Slider::ClockOpacity => format!("{}%", (self.cfg.clock.opacity * 100.0).round()),
+            Slider::ClockSize => format!("{}%", (self.sel().size * 100.0).round()),
+            Slider::ClockOpacity => format!("{}%", (self.sel().opacity * 100.0).round()),
             Slider::LauncherScale => format!("{}%", (self.cfg.launcher.scale * 100.0).round()),
             Slider::AnimSpeed => format!("{} ms", self.cfg.launcher.animation_ms),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
@@ -474,26 +531,55 @@ impl Settings {
                 self.commit_config();
             }
             Hit::ClockColor(c) => {
-                self.cfg.clock.color = c.map(|c| theme::to_hex(theme::rgb(c))).unwrap_or_default();
+                if let Some(k) = self.sel_mut() {
+                    k.color = c.map(|c| theme::to_hex(theme::rgb(c))).unwrap_or_default();
+                }
                 self.commit_config();
             }
             Hit::Hour(h) => {
-                self.cfg.clock.hour24 = h;
+                if let Some(k) = self.sel_mut() {
+                    k.hour24 = h;
+                }
                 self.commit_config();
             }
             Hit::MoveClock => {
-                self.status.clock_moving = !self.status.clock_moving;
-                self.changes.push(Change::MoveClock(self.status.clock_moving));
+                let rel = self.selected.clone().unwrap_or_default();
+                let moving_this = self.status.moving_skin.eq_ignore_ascii_case(&rel) && !rel.is_empty();
+                self.status.moving_skin = if moving_this { String::new() } else { rel.clone() };
+                self.changes.push(Change::MoveSkin(if moving_this { None } else { Some(rel) }));
             }
             Hit::ResetClock => {
-                self.cfg.clock.x = None;
-                self.cfg.clock.y = None;
-                self.cfg.clock.size = 1.0;
-                self.cfg.clock.opacity = 1.0;
-                self.cfg.clock.color.clear();
-                self.cfg.clock.hour24 = None;
+                if let Some(k) = self.sel_mut() {
+                    k.x = None;
+                    k.y = None;
+                    k.size = 1.0;
+                    k.opacity = 1.0;
+                    k.color.clear();
+                    k.hour24 = None;
+                }
                 self.commit_config();
             }
+            Hit::Expand(path) => {
+                if !self.expanded.remove(&path) {
+                    self.expanded.insert(path);
+                }
+            }
+            Hit::SelectSkin(rel) => {
+                if self.cfg.skin(&rel).is_some_and(|k| k.enabled) {
+                    self.selected = Some(rel);
+                }
+            }
+            Hit::SkinToggle(rel) => {
+                let on = !self.cfg.skin(&rel).is_some_and(|k| k.enabled);
+                self.cfg.set_skin_enabled(&rel, on);
+                if on {
+                    self.selected = Some(rel);
+                } else if self.selected.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&rel)) {
+                    self.selected = self.cfg.skins.iter().find(|k| k.enabled).map(|k| k.skin.clone());
+                }
+                self.commit_config();
+            }
+            Hit::RefreshSkins => self.refresh_library(),
             Hit::TbMode(sit, mode) => {
                 self.look_mut(sit).mode = mode.into();
                 self.commit_config();
@@ -627,8 +713,8 @@ impl Settings {
     fn close(&mut self) {
         self.finish_edit(true);
         self.stop_recording();
-        if self.status.clock_moving {
-            self.changes.push(Change::MoveClock(false));
+        if !self.status.moving_skin.is_empty() {
+            self.changes.push(Change::MoveSkin(None));
         }
         self.closed = true;
         unsafe {
@@ -818,7 +904,7 @@ impl Settings {
         let (title, subtitle) = match self.page {
             Page::General => ("General", "Startup and which modules are running"),
             Page::Appearance => ("Appearance", "Theme colour and backdrop for Lumen's windows"),
-            Page::Clock => ("Clock", "Your Rainmeter clock, drawn natively"),
+            Page::Skins => ("Skins", "Choose which Rainmeter skins stay on your desktop"),
             Page::Launcher => ("Launcher", "Search apps, files, settings and more"),
             Page::Taskbar => ("Taskbar", "Clear or tinted taskbar, by situation"),
             Page::About => ("About", "Lumen"),
@@ -831,7 +917,7 @@ impl Settings {
         let end = match self.page {
             Page::General => self.page_general(top),
             Page::Appearance => self.page_appearance(top),
-            Page::Clock => self.page_clock(top),
+            Page::Skins => self.page_skins(top),
             Page::Launcher => self.page_launcher(top),
             Page::Taskbar => self.page_taskbar(top),
             Page::About => self.page_about(top),
@@ -1022,7 +1108,7 @@ impl Settings {
 
         y = self.section("Modules", y);
         let modules: [(&'static str, char, &str, &str, bool); 3] = [
-            ("clock", '\u{E823}', "Clock", "Desktop clock from your Rainmeter skin", self.cfg.modules.clock),
+            ("clock", '\u{E8B7}', "Skins", "Rainmeter skins on your desktop", self.cfg.modules.clock),
             ("launcher", '\u{E721}', "Launcher", "PowerToys Run replacement", self.cfg.modules.launcher),
             ("taskbar", '\u{E7C4}', "Clear taskbar", "TranslucentTB replacement", self.cfg.modules.taskbar),
         ];
@@ -1093,40 +1179,114 @@ impl Settings {
         y + 68.0
     }
 
-    fn page_clock(&mut self, mut y: f32) -> f32 {
-        y = self.section("Clock", y);
-        self.card(y, 68.0, Some(('\u{E823}', None)), "Show the clock", "Desktop clock from your Rainmeter skin");
+    /// The skin library (a folder tree like Rainmeter's manager) and the options of the selected skin.
+    fn page_skins(&mut self, mut y: f32) -> f32 {
+        y = self.section("Skins", y);
+        self.card(y, 68.0, Some(('\u{E8B7}', None)), "Show skins", "Master switch for every skin below");
         self.toggle(RIGHT, y + 34.0, self.cfg.modules.clock, Hit::Module("clock"), true);
         y += 72.0;
-        let (state, color) = if !self.cfg.modules.clock {
-            ("Off", white(0.5))
-        } else if self.status.clock_ok {
-            ("Running", rgba(0.42, 0.85, 0.55, 1.0))
-        } else {
-            ("Skin not found. Check the log", rgba(0.98, 0.7, 0.35, 1.0))
-        };
-        let skin = self.status.skin.clone();
-        self.card(y, 68.0, Some(('\u{E790}', None)), "Skin", &skin);
-        self.canvas.text(state, Rect::new(RIGHT - 300.0, y, 300.0, 68.0), Font::Text, 13.0, 400, color, Align::Right);
-        y += 72.0;
         let dir = if self.status.skins_dir.is_empty() { "Rainmeter's Skins folder wasn't found".to_string() } else { self.status.skins_dir.clone() };
-        self.card(y, 68.0, Some(('\u{E8B7}', None)), "Skins folder", &dir);
-        self.button(RIGHT, y + 34.0, "Open", Hit::OpenSkins);
+        self.card(y, 68.0, Some(('\u{E838}', None)), "Skins folder", &dir);
+        let x = self.button(RIGHT, y + 34.0, "Open", Hit::OpenSkins);
+        self.button(x - 8.0, y + 34.0, "Refresh", Hit::RefreshSkins);
         y += 72.0 + 20.0;
 
-        y = self.section("Look", y);
-        self.card(y, 68.0, Some(('\u{E740}', None)), "Size", "Scales the whole clock");
+        // ---- library -----------------------------------------------------------------------
+        let running = self.cfg.skins.iter().filter(|k| k.enabled).count();
+        y = self.section(&format!("Library  ·  {running} on"), y);
+        struct Row {
+            depth: usize,
+            dir: Option<(String, bool)>,
+            name: String,
+            rel: String,
+        }
+        fn flatten(nodes: &[crate::rainmeter::Node], depth: usize, expanded: &std::collections::HashSet<String>, out: &mut Vec<Row>) {
+            for n in nodes {
+                match n {
+                    crate::rainmeter::Node::Dir { name, path, children } => {
+                        let open = expanded.contains(path);
+                        out.push(Row { depth, dir: Some((path.clone(), open)), name: name.clone(), rel: String::new() });
+                        if open {
+                            flatten(children, depth + 1, expanded, out);
+                        }
+                    }
+                    crate::rainmeter::Node::Skin { name, rel } => out.push(Row { depth, dir: None, name: name.clone(), rel: rel.clone() }),
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        flatten(&self.tree, 0, &self.expanded, &mut rows);
+        if rows.is_empty() {
+            self.card(y, 60.0, Some(('\u{E783}', None)), "No skins found", "Install skins in Rainmeter's Skins folder, then press Refresh");
+            y += 64.0;
+        }
+        for row in rows {
+            let r = Rect::new(CONTENT_X, y, CONTENT_W, 40.0);
+            let indent = row.depth as f32 * 22.0;
+            match &row.dir {
+                Some((path, open)) => {
+                    let hit = Hit::Expand(path.clone());
+                    let hov = self.hover.as_ref() == Some(&hit);
+                    self.canvas.fill(r, 6.0, white(if hov { 0.07 } else { 0.04 }));
+                    self.canvas.glyph(if *open { '\u{E70D}' } else { '\u{E76C}' }, Rect::new(r.x + 12.0 + indent, y, 18.0, 40.0), 11.0, white(0.7));
+                    self.canvas.glyph('\u{E8B7}', Rect::new(r.x + 34.0 + indent, y, 22.0, 40.0), 15.0, rgba(0.94, 0.62, 0.15, 1.0));
+                    self.canvas.text(&row.name, Rect::new(r.x + 64.0 + indent, y, CONTENT_W - 120.0, 40.0), Font::Text, 13.5, 500, white(0.92), Align::Left);
+                    self.regions.push((r, hit));
+                }
+                None => {
+                    let on = self.cfg.skin(&row.rel).is_some_and(|k| k.enabled);
+                    let selected = on && self.selected.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(&row.rel));
+                    let select = Hit::SelectSkin(row.rel.clone());
+                    let hov = self.hover.as_ref() == Some(&select);
+                    self.canvas.fill(r, 6.0, white(if selected { 0.1 } else if hov { 0.07 } else { 0.035 }));
+                    if selected {
+                        self.canvas.fill(Rect::new(r.x, y + 10.0, 3.0, 20.0), 1.5, self.accent());
+                    }
+                    self.canvas.glyph('\u{E7C3}', Rect::new(r.x + 36.0 + indent, y, 22.0, 40.0), 14.0, white(if on { 0.95 } else { 0.5 }));
+                    self.canvas.text(&row.name, Rect::new(r.x + 66.0 + indent, y, CONTENT_W - 190.0, 40.0), Font::Text, 13.5, 400, white(if on { 0.97 } else { 0.7 }), Align::Left);
+                    if let Some((_, note)) = self.status.skin_notes.iter().find(|(k, _)| k.eq_ignore_ascii_case(&row.rel)) {
+                        if !note.is_empty() && on {
+                            let tag = Rect::new(RIGHT - 120.0, y + 11.0, 66.0, 18.0);
+                            self.canvas.fill(tag, 9.0, rgba(0.98, 0.7, 0.35, 0.18));
+                            self.canvas.text("Partial", tag, Font::Text, 10.5, 500, rgba(0.98, 0.76, 0.45, 1.0), Align::Center);
+                        }
+                    }
+                    self.regions.push((r, select));
+                    self.toggle(RIGHT, y + 20.0, on, Hit::SkinToggle(row.rel.clone()), false);
+                }
+            }
+            y += 42.0;
+        }
+        y += 18.0;
+
+        // ---- options of the selected skin -----------------------------------------------------------
+        let Some(rel) = self.selected.clone().filter(|r| self.cfg.skin(r).is_some_and(|k| k.enabled)) else {
+            return y;
+        };
+        let title = rel.rsplit('\\').next().unwrap_or(&rel).trim_end_matches(".ini").to_string();
+        y = self.section(&format!("Options  ·  {title}"), y);
+        let note = self.status.skin_notes.iter().find(|(k, _)| k.eq_ignore_ascii_case(&rel)).map(|(_, n)| n.clone()).unwrap_or_default();
+        let (state, color) = if note.is_empty() {
+            if self.status.skins_running == 0 { ("Starting…".to_string(), white(0.5)) } else { ("Fully supported".to_string(), rgba(0.42, 0.85, 0.55, 1.0)) }
+        } else {
+            (note, rgba(0.98, 0.76, 0.45, 1.0))
+        };
+        self.card(y, 68.0, Some(('\u{E73E}', None)), "Compatibility", "Lumen draws text and shapes, and time. More meters are coming");
+        self.canvas.text(&state, Rect::new(RIGHT - 320.0, y, 320.0, 68.0), Font::Text, 12.5, 400, color, Align::Right);
+        y += 72.0;
+
+        self.card(y, 68.0, Some(('\u{E740}', None)), "Size", "Scales the whole skin");
         let v = self.slider_label(Slider::ClockSize);
         self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::ClockSize, None);
         self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
         y += 72.0;
-        self.card(y, 68.0, Some(('\u{E793}', None)), "Opacity", "How see-through the clock is");
+        self.card(y, 68.0, Some(('\u{E793}', None)), "Opacity", "How see-through the skin is");
         let v = self.slider_label(Slider::ClockOpacity);
         self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::ClockOpacity, None);
         self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
         y += 72.0;
-        self.card(y, 68.0, Some(('\u{E823}', None)), "Time format", "");
-        let sel = match self.cfg.clock.hour24 {
+        self.card(y, 68.0, Some(('\u{E823}', None)), "Time format", "For skins that show the time");
+        let sel = match self.sel().hour24 {
             None => 0,
             Some(false) => 1,
             Some(true) => 2,
@@ -1136,7 +1296,7 @@ impl Settings {
 
         // Colour: skin default, swatches, then hue and saturation for anything else.
         self.card(y, 172.0, Some(('\u{E771}', None)), "Colour", "Text and lines");
-        let current = theme::parse_hex(&self.cfg.clock.color);
+        let current = theme::parse_hex(&self.sel().color);
         let mut x = CONTENT_X + 74.0;
         let cy = y + 84.0;
         self.swatch(x, cy, rgba(0.5, 0.5, 0.5, 1.0), current.is_none(), Hit::ClockColor(None));
@@ -1155,15 +1315,13 @@ impl Settings {
         self.slider_row(y + 134.0, "Saturation", Slider::ClockSat, Some(&sats));
         y += 176.0 + 20.0;
 
-        y = self.section("Position", y);
-        let moving = self.status.clock_moving;
-        self.card(y, 68.0, Some(('\u{E7C2}', None)), "Move the clock", if moving { "Drag the clock on your desktop, then press Done" } else { "Lets you drag the clock to a new spot" });
+        let moving = self.status.moving_skin.eq_ignore_ascii_case(&rel);
+        self.card(y, 68.0, Some(('\u{E7C2}', None)), "Move on the desktop", if moving { "Drag the skin on your desktop, then press Done" } else { "Lets you drag this skin to a new spot" });
         let x = self.button(RIGHT, y + 34.0, if moving { "Done" } else { "Move" }, Hit::MoveClock);
         self.button(x - 8.0, y + 34.0, "Reset all", Hit::ResetClock);
         y += 72.0;
-        self.card(y, 68.0, Some(('\u{E72C}', None)), "Reload skin", "Edits to the skin files also reload on their own within a minute");
-        let x = self.button(RIGHT, y + 34.0, "Reload", Hit::ReloadSkin);
-        self.button(x - 8.0, y + 34.0, "Open skins folder", Hit::OpenSkins);
+        self.card(y, 68.0, Some(('\u{E72C}', None)), "Reload skins", "Edits to skin files also reload on their own within a minute");
+        self.button(RIGHT, y + 34.0, "Reload", Hit::ReloadSkin);
         y + 68.0
     }
 
@@ -1447,6 +1605,7 @@ pub fn snapshot(cfg: &Config, status: Status, page: Page) -> Option<(u32, u32, V
     let mut s = Settings::new(HWND::default(), cfg, status, 1.25, false);
     s.page = page;
     s.closed = true;
+    s.refresh_library();
     let (w, h) = ((W * 1.25) as u32, (H * 1.25) as u32);
     unsafe {
         let dc = CreateCompatibleDC(None);
