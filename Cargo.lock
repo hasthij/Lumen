@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "toml",
@@ -44,14 +44,14 @@ dependencies = [
 
 [[package]]
 name = "lumen-setup"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "lumen-tap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "windows",
  "windows-core",
