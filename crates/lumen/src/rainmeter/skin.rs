@@ -270,6 +270,16 @@ impl Skin {
     }
 
     /// Lays the skin out at `now`. `measure` returns the pixel width and height of a string.
+    /// Every FontFace the skin's string meters use (lower-case), so only those fonts get loaded.
+    pub fn font_faces(&self) -> HashSet<String> {
+        self.meters
+            .iter()
+            .filter_map(|m| self.opt(m, "FontFace"))
+            .map(|f| f.trim().to_lowercase())
+            .filter(|f| !f.is_empty())
+            .collect()
+    }
+
     pub fn layout(&self, now: &SYSTEMTIME, measure: &mut dyn FnMut(&str, &TextStyle) -> (f32, f32)) -> Scene {
         let mut scene = Scene::default();
         // Previous meter's anchor and size, for relative positioning.

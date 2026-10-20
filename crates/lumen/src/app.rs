@@ -46,10 +46,19 @@ fn desktop_in_front() -> Option<bool> {
         let fg = GetForegroundWindow();
         let mut buf = [0u16; 64];
         let n = GetClassNameW(fg, &mut buf) as usize;
-        match String::from_utf16_lossy(&buf[..n]).as_str() {
+        let class = String::from_utf16_lossy(&buf[..n]);
+        match class.as_str() {
             "Progman" | "WorkerW" => Some(true),
-            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "LumenLauncher" | "LumenSettings" | "LumenApp" | "" => None,
-            _ => Some(false),
+            // Right-clicking the desktop opens a menu ("#32768") that briefly becomes the
+            // foreground window; it must not count as "an app is in front", or the clock
+            // would drop behind the desktop while the menu is open.
+            c if c.starts_with('#') => None,
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "ForegroundStaging" | "LumenLauncher" | "LumenSettings" | "LumenApp" | "" => None,
+            _ => {
+                // Tool windows, tooltips and similar helpers aren't apps either.
+                let ex = GetWindowLongPtrW(fg, GWL_EXSTYLE) as u32;
+                if ex & WS_EX_TOOLWINDOW.0 != 0 { None } else { Some(false) }
+            }
         }
     }
 }
