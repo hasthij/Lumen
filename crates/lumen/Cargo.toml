@@ -12,6 +12,7 @@ dev-logs = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 
 [dependencies.windows]
 version = "0.58"

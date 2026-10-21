@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::rainmeter::skin::{Item, Rgba, Scene, TextStyle};
@@ -258,6 +259,9 @@ pub struct LayeredSurface {
     target: Option<ID2D1DCRenderTarget>,
     dc: HDC,
     bitmap: HBITMAP,
+    /// Decoded pictures (key: path and tint), made for the current render target.
+    images: HashMap<String, Option<ID2D1Bitmap>>,
+    wic: Option<IWICImagingFactory>,
     bits: *mut u8,
     old: HGDIOBJ,
     width: u32,
@@ -271,7 +275,7 @@ impl LayeredSurface {
         if dc.is_invalid() {
             return Err(windows::core::Error::from_win32());
         }
-        Ok(Self { d2d, target: None, dc, bitmap: HBITMAP::default(), bits: std::ptr::null_mut(), old: HGDIOBJ::default(), width: 0, height: 0 })
+        Ok(Self { d2d, target: None, dc, bitmap: HBITMAP::default(), images: HashMap::new(), wic: None, bits: std::ptr::null_mut(), old: HGDIOBJ::default(), width: 0, height: 0 })
     }
 
     fn ensure_size(&mut self, width: u32, height: u32) -> Result<()> {
@@ -333,6 +337,7 @@ impl LayeredSurface {
             // Device or target trouble: drop the target and try once more from scratch.
             crate::warn!("draw failed ({e}), recreating render target");
             self.target = None;
+            self.images.clear();
             self.draw(fonts, scene, scale)?;
         }
         let size = SIZE { cx: self.width as i32, cy: self.height as i32 };
@@ -359,6 +364,47 @@ impl LayeredSurface {
         Ok((self.width, self.height, pixels))
     }
 
+    /// A picture file as a Direct2D bitmap, multiplied by `tint`. Cached; a file that can't be
+    /// read is remembered as missing so it isn't retried every draw.
+    unsafe fn image(&mut self, target: &ID2D1DCRenderTarget, path: &str, tint: &Rgba) -> Option<ID2D1Bitmap> {
+        let key = format!("{path}|{:.2},{:.2},{:.2}", tint[0], tint[1], tint[2]);
+        if let Some(b) = self.images.get(&key) {
+            return b.clone();
+        }
+        if self.wic.is_none() {
+            self.wic = windows::Win32::System::Com::CoCreateInstance(&CLSID_WICImagingFactory, None, windows::Win32::System::Com::CLSCTX_INPROC_SERVER).ok();
+        }
+        let bitmap = (|| -> Option<ID2D1Bitmap> {
+            let wic = self.wic.as_ref()?;
+            let decoder = wic.CreateDecoderFromFilename(&HSTRING::from(path), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+            let frame = decoder.GetFrame(0).ok()?;
+            let conv = wic.CreateFormatConverter().ok()?;
+            conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+            let (mut w, mut h) = (0u32, 0u32);
+            conv.GetSize(&mut w, &mut h).ok()?;
+            let mut data = vec![0u8; (w * h * 4) as usize];
+            conv.CopyPixels(std::ptr::null(), w * 4, &mut data).ok()?;
+            if tint[0] < 1.0 || tint[1] < 1.0 || tint[2] < 1.0 {
+                for px in data.chunks_exact_mut(4) {
+                    px[0] = (px[0] as f32 * tint[2]) as u8;
+                    px[1] = (px[1] as f32 * tint[1]) as u8;
+                    px[2] = (px[2] as f32 * tint[0]) as u8;
+                }
+            }
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            target.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(data.as_ptr() as *const _), w * 4, &props).ok()
+        })();
+        if bitmap.is_none() {
+            crate::warn!("could not load image {path}");
+        }
+        self.images.insert(key, bitmap.clone());
+        bitmap
+    }
+
     fn draw(&mut self, fonts: &mut Fonts, scene: &Scene, scale: f32) -> Result<()> {
         let target = self.target()?;
         let rect = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
@@ -374,10 +420,26 @@ impl LayeredSurface {
 
             for item in &scene.items {
                 match item {
-                    Item::Text { text, style, color: c, x, y, .. } => {
+                    Item::Text { text, style, color: c, x, y, stretch } => {
                         if let Ok(layout) = fonts.layout(text, style) {
                             brush.SetColor(&color(c));
+                            // Horizontal stretch (TransformationMatrix) keeps the left edge in place.
+                            if (*stretch - 1.0).abs() > f32::EPSILON {
+                                target.SetTransform(&windows::Foundation::Numerics::Matrix3x2 { M11: *stretch, M12: 0.0, M21: 0.0, M22: 1.0, M31: *x * (1.0 - *stretch), M32: 0.0 });
+                            }
                             target.DrawTextLayout(D2D_POINT_2F { x: *x, y: *y }, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                            if (*stretch - 1.0).abs() > f32::EPSILON {
+                                target.SetTransform(&windows::Foundation::Numerics::Matrix3x2::identity());
+                            }
+                        }
+                    }
+                    Item::Image { path, x, y, w, h, alpha, tint } => {
+                        if let Some(bmp) = self.image(&target, path, tint) {
+                            let size = bmp.GetSize();
+                            let dw = if *w > 0.0 { *w } else { size.width };
+                            let dh = if *h > 0.0 { *h } else if *w > 0.0 && size.width > 0.0 { *w * size.height / size.width } else { size.height };
+                            let dest = D2D_RECT_F { left: *x, top: *y, right: x + dw, bottom: y + dh };
+                            target.DrawBitmap(&bmp, Some(&dest), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                         }
                     }
                     Item::Rect { x, y, w, h, radius, fill, stroke, stroke_width } => {

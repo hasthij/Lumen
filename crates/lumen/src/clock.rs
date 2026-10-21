@@ -355,9 +355,16 @@ fn scene_key(scene: &Scene) -> String {
     use crate::rainmeter::skin::Item;
     let mut key = format!("{}x{}", scene.width, scene.height);
     for item in &scene.items {
-        if let Item::Text { text, .. } = item {
-            key.push('|');
-            key.push_str(text);
+        match item {
+            Item::Text { text, .. } => {
+                key.push('|');
+                key.push_str(text);
+            }
+            Item::Image { path, .. } => {
+                key.push('|');
+                key.push_str(path);
+            }
+            _ => {}
         }
     }
     key

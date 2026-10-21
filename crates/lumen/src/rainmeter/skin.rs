@@ -37,7 +37,10 @@ pub struct TextStyle {
 
 #[derive(Debug, Clone)]
 pub enum Item {
-    Text { text: String, style: TextStyle, color: Rgba, x: f32, y: f32 },
+    /// `stretch` is the horizontal scale from TransformationMatrix (1.0 = none).
+    Text { text: String, style: TextStyle, color: Rgba, x: f32, y: f32, stretch: f32 },
+    /// A picture file. `h` of 0 keeps the picture's own proportions; `tint` multiplies its colours.
+    Image { path: String, x: f32, y: f32, w: f32, h: f32, alpha: f32, tint: Rgba },
     Rect { x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Rgba, stroke: Rgba, stroke_width: f32 },
 }
 
@@ -52,6 +55,8 @@ struct Measure {
     kind: String,
     format: String,
     substitutes: Vec<(String, String)>,
+    /// RegExpSubstitute=1: the substitute patterns are regular expressions.
+    regex: Vec<(regex::Regex, String)>,
 }
 
 /// Lumen-side adjustments applied over the skin's own variables (files are not touched).
@@ -71,6 +76,9 @@ pub struct Skin {
     /// Files whose change should trigger a reload, with the mtime seen at load.
     watched: Vec<(PathBuf, Option<SystemTime>)>,
     pub needs_seconds: bool,
+    /// x, y, width, height of every meter from the previous layout pass, for `[Meter:W]` style
+    /// references (a meter may refer to ones that come after it).
+    geo: std::cell::RefCell<HashMap<String, [f64; 4]>>,
     /// Meters and measures this skin uses that Lumen doesn't draw yet (short names).
     pub unsupported: Vec<String>,
 }
@@ -104,6 +112,7 @@ impl Skin {
             meters: Vec::new(),
             watched: vec![(file.clone(), mtime(&file))],
             needs_seconds: false,
+            geo: Default::default(),
             unsupported: Vec::new(),
         };
 
@@ -127,10 +136,34 @@ impl Skin {
                     unsupported.push(format!("Measure={kind} [{}]", s.name));
                 }
                 let substitutes = s.get("Substitute").map(|v| parse_substitute(&skin.expand(v))).unwrap_or_default();
-                skin.measures.insert(s.name.to_ascii_lowercase(), Measure { kind, format, substitutes });
+                let use_regex = s.get("RegExpSubstitute").is_some_and(|v| v.trim() == "1");
+                let regex = if use_regex {
+                    substitutes
+                        .iter()
+                        .filter_map(|(from, to)| {
+                            // Rainmeter writes group references as \1; the regex crate wants ${1}.
+                            let mut rep = String::new();
+                            let mut chars = to.chars().peekable();
+                            while let Some(c) = chars.next() {
+                                match (c, chars.peek()) {
+                                    ('\\', Some(d)) if d.is_ascii_digit() => {
+                                        rep.push_str(&format!("${{{d}}}"));
+                                        chars.next();
+                                    }
+                                    ('$', _) => rep.push_str("$$"),
+                                    _ => rep.push(c),
+                                }
+                            }
+                            regex::Regex::new(from).ok().map(|r| (r, rep))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                skin.measures.insert(s.name.to_ascii_lowercase(), Measure { kind, format, substitutes, regex });
             } else if let Some(kind) = s.get("Meter") {
                 let k = kind.to_ascii_lowercase();
-                if k != "string" && k != "shape" {
+                if k != "string" && k != "shape" && k != "image" {
                     unsupported.push(format!("Meter={kind} [{}]", s.name));
                 }
                 skin.meters.push(s);
@@ -251,8 +284,24 @@ impl Skin {
         s.get(key).map(|v| unquote(&self.expand(v)).to_string())
     }
 
+    /// Evaluates a number or formula; `[Meter:X|Y|W|H]` read the previous layout pass.
+    fn eval(&self, v: &str) -> Option<f64> {
+        formula::number_with(v, &|name| {
+            let (meter, prop) = name.split_once(':')?;
+            let geo = self.geo.borrow();
+            let g = geo.get(&meter.trim().to_ascii_lowercase())?;
+            Some(match prop.trim().to_ascii_lowercase().as_str() {
+                "x" => g[0],
+                "y" => g[1],
+                "w" => g[2],
+                "h" => g[3],
+                _ => return None,
+            })
+        })
+    }
+
     fn num(&self, s: &Section, key: &str, default: f64) -> f64 {
-        self.opt(s, key).and_then(|v| formula::number(&v)).unwrap_or(default)
+        self.opt(s, key).and_then(|v| self.eval(&v)).unwrap_or(default)
     }
 
     fn measure_value(&self, name: &str, now: &SYSTEMTIME) -> String {
@@ -261,9 +310,15 @@ impl Skin {
             return String::new();
         }
         let mut v = time::format(&m.format, now);
-        for (from, to) in &m.substitutes {
-            if !from.is_empty() {
-                v = v.replace(from.as_str(), to);
+        if !m.regex.is_empty() {
+            for (re, rep) in &m.regex {
+                v = re.replace_all(&v, rep.as_str()).into_owned();
+            }
+        } else {
+            for (from, to) in &m.substitutes {
+                if !from.is_empty() {
+                    v = v.replace(from.as_str(), to);
+                }
             }
         }
         v
@@ -280,8 +335,16 @@ impl Skin {
             .collect()
     }
 
+    /// Lays the skin out at `now`. Two passes, so a meter can use the size or position of a
+    /// meter that comes after it (`[MeterDate:Y]`), as Rainmeter skins often do.
     pub fn layout(&self, now: &SYSTEMTIME, measure: &mut dyn FnMut(&str, &TextStyle) -> (f32, f32)) -> Scene {
+        let _ = self.layout_pass(now, measure);
+        self.layout_pass(now, measure)
+    }
+
+    fn layout_pass(&self, now: &SYSTEMTIME, measure: &mut dyn FnMut(&str, &TextStyle) -> (f32, f32)) -> Scene {
         let mut scene = Scene::default();
+        let mut geo: HashMap<String, [f64; 4]> = HashMap::new();
         // Previous meter's anchor and size, for relative positioning.
         let (mut px, mut py, mut pw, mut ph) = (0i32, 0i32, 0i32, 0i32);
         let (mut max_r, mut max_b) = (0f32, 0f32);
@@ -293,12 +356,14 @@ impl Skin {
             let x = self.position(m, "X", px, pw);
             let y = self.position(m, "Y", py, ph);
             let (w, h);
+            let solid = self.opt(m, "SolidColor").and_then(|c| parse_color(&c)).filter(|c| c[3] > 0.0);
 
             match kind.as_str() {
                 "string" => {
                     let style = self.text_style(m);
                     let text = self.meter_text(m, now);
                     let (tw, th) = if text.is_empty() { (0.0, 0.0) } else { measure(&text, &style) };
+                    let stretch = self.opt(m, "TransformationMatrix").and_then(|t| t.split(';').next().and_then(|a| self.eval(a))).map_or(1.0, |v| v as f32).max(0.05);
                     let align = match self.opt(m, "StringAlign").unwrap_or_default().to_ascii_lowercase() {
                         a if a.starts_with("center") => Align::Center,
                         a if a.starts_with("right") => Align::Right,
@@ -311,11 +376,46 @@ impl Skin {
                     };
                     w = tw.ceil() as i32;
                     h = th.ceil() as i32;
-                    if !hidden && !text.is_empty() {
-                        let color = self.color(&self.opt(m, "FontColor").unwrap_or_default(), [0.0, 0.0, 0.0, 1.0]);
-                        max_r = max_r.max(left + tw);
-                        max_b = max_b.max(y as f32 + th);
-                        scene.items.push(Item::Text { text, style, color, x: left, y: y as f32 });
+                    if !hidden {
+                        if let Some(c) = solid {
+                            let (bw, bh) = (self.num(m, "W", tw as f64) as f32, self.num(m, "H", th as f64) as f32);
+                            scene.items.push(Item::Rect { x: left, y: y as f32, w: bw, h: bh, radius: 0.0, fill: c, stroke: [0.0; 4], stroke_width: 0.0 });
+                        }
+                        if !text.is_empty() {
+                            let color = self.color(&self.opt(m, "FontColor").unwrap_or_default(), [0.0, 0.0, 0.0, 1.0]);
+                            max_r = max_r.max(left + tw * stretch);
+                            max_b = max_b.max(y as f32 + th);
+                            scene.items.push(Item::Text { text, style, color, x: left, y: y as f32, stretch });
+                        }
+                    }
+                }
+                "image" => {
+                    let iw = self.num(m, "W", 0.0) as f32;
+                    let ih = self.num(m, "H", 0.0) as f32;
+                    // Icons are square when only a width is given; the picture keeps its own
+                    // proportions when it is drawn, so this only matters for layout references.
+                    w = iw.round() as i32;
+                    h = if ih > 0.0 { ih.round() as i32 } else { iw.round() as i32 };
+                    if !hidden {
+                        if let (Some(c), true, true) = (solid, iw > 0.0, ih > 0.0) {
+                            scene.items.push(Item::Rect { x: x as f32, y: y as f32, w: iw, h: ih, radius: 0.0, fill: c, stroke: [0.0; 4], stroke_width: 0.0 });
+                            max_r = max_r.max(x as f32 + iw);
+                            max_b = max_b.max(y as f32 + ih);
+                        }
+                        if let Some(name) = self.opt(m, "ImageName").filter(|n| !n.trim().is_empty()) {
+                            let mut path = PathBuf::from(name.trim());
+                            if path.is_relative() {
+                                let base = self.opt(m, "ImagePath").map(PathBuf::from).or_else(|| self.file.parent().map(|d| d.to_path_buf())).unwrap_or_default();
+                                path = base.join(path);
+                            }
+                            let alpha = self.num(m, "ImageAlpha", 255.0).clamp(0.0, 255.0) as f32 / 255.0;
+                            let tint = self.opt(m, "ImageTint").and_then(|t| parse_color(&t)).unwrap_or([1.0; 4]);
+                            if iw > 0.0 {
+                                max_r = max_r.max(x as f32 + iw);
+                                max_b = max_b.max(y as f32 + if ih > 0.0 { ih } else { iw });
+                            }
+                            scene.items.push(Item::Image { path: path.display().to_string(), x: x as f32, y: y as f32, w: iw, h: ih, alpha, tint });
+                        }
                     }
                 }
                 "shape" => {
@@ -346,6 +446,7 @@ impl Skin {
                 }
             }
 
+            geo.insert(m.name.to_ascii_lowercase(), [x as f64, y as f64, w as f64, h as f64]);
             // String meters anchor relative positioning on their X (the align point).
             px = x;
             py = y;
@@ -353,6 +454,7 @@ impl Skin {
             ph = h;
         }
 
+        *self.geo.borrow_mut() = geo;
         scene.width = max_r.ceil().max(1.0) as u32;
         scene.height = max_b.ceil().max(1.0) as u32;
         scene
@@ -366,7 +468,7 @@ impl Skin {
             Some('R') => (&raw[..raw.len() - 1], Some(true)),
             _ => (raw, None),
         };
-        let v = formula::number(body).unwrap_or(0.0) as i32;
+        let v = self.eval(body).unwrap_or(0.0) as i32;
         match rel {
             None => v,
             Some(false) => prev + v,
@@ -377,7 +479,7 @@ impl Skin {
     fn text_style(&self, m: &Section) -> TextStyle {
         let style = self.opt(m, "StringStyle").unwrap_or_default().to_ascii_lowercase();
         let mut weight = if style.contains("bold") { 700 } else { 400 };
-        if let Some(fw) = self.opt(m, "FontWeight").and_then(|v| formula::number(&v)) {
+        if let Some(fw) = self.opt(m, "FontWeight").and_then(|v| self.eval(&v)) {
             weight = fw.clamp(1.0, 999.0) as u32;
         }
         let mut spacing = [0.0; 3];
@@ -386,7 +488,7 @@ impl Skin {
             let parts: Vec<&str> = v.split('|').map(str::trim).collect();
             if parts.first().is_some_and(|p| p.eq_ignore_ascii_case("CharacterSpacing")) {
                 for (i, p) in parts.iter().skip(1).take(3).enumerate() {
-                    spacing[i] = formula::number(p).unwrap_or(0.0) as f32;
+                    spacing[i] = self.eval(p).unwrap_or(0.0) as f32;
                 }
             }
         }
@@ -441,7 +543,7 @@ impl Skin {
         if !kind.eq_ignore_ascii_case("Rectangle") {
             return None;
         }
-        let a: Vec<f32> = split_args(args).iter().filter_map(|s| formula::number(s)).map(|v| v as f32).collect();
+        let a: Vec<f32> = split_args(args).iter().filter_map(|s| self.eval(s)).map(|v| v as f32).collect();
         if a.len() < 4 {
             return None;
         }
@@ -455,7 +557,7 @@ impl Skin {
             } else if let Some(c) = lower.strip_prefix("stroke color") {
                 stroke = parse_color(c.trim()).unwrap_or(stroke);
             } else if let Some(n) = lower.strip_prefix("strokewidth") {
-                stroke_width = formula::number(n.trim()).unwrap_or(1.0) as f32;
+                stroke_width = self.eval(n.trim()).unwrap_or(1.0) as f32;
             }
         }
         Some(Item::Rect {
