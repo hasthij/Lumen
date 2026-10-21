@@ -1,6 +1,6 @@
 [package]
 name = "lumen-tap"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Lumen's taskbar helper, loaded into Explorer through XAML diagnostics"
