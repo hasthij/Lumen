@@ -39,8 +39,14 @@ const TOP_BOX: (f32, f32) = (900.0, 270.0);
 const SIDE_BOX: (f32, f32) = (360.0, 600.0);
 const F: f32 = 14.0; // fillet margin along the docked edge
 const PEEK: f32 = 0.28;
-const PEEK_EXT: f32 = 16.0;
-const PEEK_HH: f32 = 40.0;
+const PEEK_EXT: f32 = 24.0;
+const PEEK_HH: f32 = 64.0;
+// Tiles for other media sessions: side by side on the top edge, stacked on the sides.
+const MAX_TILES: usize = 3;
+const TILE_W: f32 = 200.0; // top dock
+const TILE_H: f32 = 72.0; // side docks
+const TILE_GAP: f32 = 14.0;
+const SIDE_TILES_Y: f32 = 452.0;
 const TABS: [(f32, f32, Tab); 2] = [(24.0, 96.0, Tab::Clip), (124.0, 76.0, Tab::Media)];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,10 +65,6 @@ struct Lay {
     sy: f32,
     cy: f32,
     cxs: [f32; 3],
-    sec_x: f32,
-    sec_y: f32,
-    sec_w: f32,
-    sec_n: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -243,6 +245,8 @@ pub struct Island {
     art_seen: u32,
     art_id: String,
     tab: Tab,
+    /// Other media sessions shown as tiles (0..=MAX_TILES); the panel grows to fit them.
+    tiles: usize,
     s: f32,
     org: (i32, i32),
     mon: RECT,
@@ -304,6 +308,7 @@ impl Island {
                 art_seen: u32::MAX,
                 art_id: String::new(),
                 tab: Tab::Clip,
+                tiles: 0,
                 s: 1.0,
                 org: (0, 0),
                 mon: RECT::default(),
@@ -348,7 +353,35 @@ impl Island {
 
     /// Content box (w, h): wide on the top edge, tall on the sides. Same for both tabs.
     fn cb(&self) -> (f32, f32) {
-        if self.side == Side::Top { TOP_BOX } else { SIDE_BOX }
+        let t = if self.tab == Tab::Media { self.tiles as f32 } else { 0.0 };
+        if self.side == Side::Top {
+            (TOP_BOX.0 + t * (TILE_W + TILE_GAP), TOP_BOX.1)
+        } else if t > 0.0 {
+            (SIDE_BOX.0, SIDE_BOX.1.max(SIDE_TILES_Y + t * (TILE_H + TILE_GAP) - TILE_GAP + 20.0))
+        } else {
+            SIDE_BOX
+        }
+    }
+
+    /// Card rect (x, y, w, h) of media tile `i` in content coordinates.
+    fn tile(&self, i: usize) -> (f32, f32, f32, f32) {
+        let i = i as f32;
+        if self.side == Side::Top {
+            (TOP_BOX.0 - 24.0 + TILE_GAP + i * (TILE_W + TILE_GAP), 58.0, TILE_W, 178.0)
+        } else {
+            (24.0, SIDE_TILES_Y + i * (TILE_H + TILE_GAP), SIDE_BOX.0 - 48.0, TILE_H)
+        }
+    }
+
+    /// Resizes the panel when the number of tiles it should show changes.
+    unsafe fn sync_tiles(&mut self) {
+        let t = self.media_len().saturating_sub(1).min(MAX_TILES);
+        if t != self.tiles {
+            self.tiles = t;
+            if self.tab == Tab::Media && self.shown {
+                self.place();
+            }
+        }
     }
 
     fn win_design(&self) -> (f32, f32) {
@@ -382,11 +415,15 @@ impl Island {
     }
 
     fn lay(&self) -> Lay {
-        let (w, h) = self.cb();
+        // The main player keeps the base box; tiles get the extra space cb() adds.
         if self.side == Side::Top {
-            Lay { art: (24.0, 62.0, 170.0), tx: 218.0, tw: 400.0, ty: 66.0, sy: 150.0, cy: 206.0, cxs: [358.0, 418.0, 478.0], sec_x: 650.0, sec_y: 62.0, sec_w: w - 24.0 - 650.0, sec_n: ((h - 16.0 - 62.0) / 40.0) as usize }
+            let tx = 218.0;
+            let tw = TOP_BOX.0 - 24.0 - tx;
+            let mid = tx + tw / 2.0;
+            Lay { art: (24.0, 62.0, 170.0), tx, tw, ty: 66.0, sy: 150.0, cy: 206.0, cxs: [mid - 64.0, mid, mid + 64.0] }
         } else {
-            Lay { art: ((w - 200.0) / 2.0, 60.0, 200.0), tx: 24.0, tw: w - 48.0, ty: 276.0, sy: 340.0, cy: 408.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0], sec_x: 24.0, sec_y: 450.0, sec_w: w - 48.0, sec_n: ((h - 16.0 - 450.0) / 40.0) as usize }
+            let w = SIDE_BOX.0;
+            Lay { art: ((w - 200.0) / 2.0, 60.0, 200.0), tx: 24.0, tw: w - 48.0, ty: 276.0, sy: 340.0, cy: 408.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0] }
         }
     }
 
@@ -533,6 +570,7 @@ impl Island {
     }
 
     unsafe fn show(&mut self) {
+        self.tiles = self.media_len().saturating_sub(1).min(MAX_TILES);
         self.place();
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -655,11 +693,14 @@ impl Island {
         };
         let band = (100.0 * self.s) as i32;
         let at_edge = depth <= 1 && along.abs() <= band;
+        // The notch shows up as soon as the cursor is in the screen quarter next to the docked edge.
+        let span = if self.side == Side::Top { self.mon.bottom - self.mon.top } else { self.mon.right - self.mon.left };
+        let near = depth <= span / 4 && along.abs() <= (300.0 * self.s) as i32;
         let (emax, hmax) = self.maxes();
         let inside = |r: RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
         match self.mode {
             Mode::Hidden => {
-                if at_edge && !down {
+                if near && !down {
                     let busy = SHQueryUserNotificationState()
                         .map(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE)
                         .unwrap_or(false);
@@ -673,7 +714,7 @@ impl Island {
                 let on = inside(self.screen_rect(PEEK_EXT, PEEK_HH, 8));
                 if (on && depth >= 2) || (at_edge && now.duration_since(self.peek_since) >= Duration::from_millis(30)) {
                     self.set_mode(Mode::Open);
-                } else if !on && !at_edge {
+                } else if !on && !at_edge && !near {
                     let since = *self.off_since.get_or_insert(now);
                     if now.duration_since(since) >= Duration::from_millis(250) {
                         self.set_mode(Mode::Hidden);
@@ -979,7 +1020,7 @@ impl Island {
             None => 0.0,
         };
         let shown = if let Some(f) = self.drag { f * dur } else { pos };
-        let app = p.id.rsplit(['!', '\\', '.']).find(|x| !x.is_empty() && *x != "exe").unwrap_or("");
+        let app = media::app_name(&p.id);
         c.text(&format!("{}{}", if p.playing { "Now playing \u{B7} " } else { "Paused \u{B7} " }, app), &fo.small, l.tx, l.ty + 46.0, l.tw, 16.0, 0.4);
         let hot_bar = self.hover == Hover::Scrub || self.drag.is_some();
         let bh = if hot_bar { 6.0 } else { 4.0 };
@@ -1005,15 +1046,43 @@ impl Island {
             }
         }
 
-        // Other apps: smaller inline rows.
-        for (i, s) in sessions.iter().skip(1).take(l.sec_n).enumerate() {
-            let y = l.sec_y + 40.0 * i as f32;
-            c.rrect(l.sec_x, y, l.sec_w, 36.0, 10.0, if self.hover == Hover::Sec(i) { 0.11 } else { 0.04 });
-            c.rrect(l.sec_x + 6.0, y + 4.0, 28.0, 28.0, 8.0, 0.09);
-            c.text("\u{E8D6}", &fo.icon, l.sec_x + 6.0, y + 4.0, 28.0, 28.0, 0.7);
-            let label = if s.artist.is_empty() { s.title.clone() } else { format!("{} \u{2013} {}", s.title, s.artist) };
-            c.text(&label, &fo.body, l.sec_x + 38.0, y, l.sec_w - 38.0 - 40.0, 36.0, 0.85);
-            c.text(if s.playing { "\u{E769}" } else { "\u{E768}" }, &fo.icon, l.sec_x + l.sec_w - 36.0, y, 32.0, 36.0, 0.8);
+        // Other apps: one card each, side by side (top dock) or stacked (side docks).
+        for (i, s) in sessions.iter().skip(1).take(self.tiles).enumerate() {
+            let (x, y, w, h) = self.tile(i);
+            let hot = self.hover == Hover::Sec(i);
+            let glyph = if s.playing { "\u{E769}" } else { "\u{E768}" };
+            let status = format!("{} \u{B7} {}", media::app_name(&s.id), if s.playing { "Playing" } else { "Paused" });
+            c.rrect(x, y, w, h, 16.0, if hot { 0.12 } else { 0.06 });
+            let frac = if s.dur > 0.0 { (s.position() / s.dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            if self.side == Side::Top {
+                c.rrect(x + 14.0, y + 14.0, 40.0, 40.0, 10.0, 0.1);
+                c.text("\u{E8D6}", &fo.icon_big, x + 14.0, y + 14.0, 40.0, 40.0, 0.75);
+                c.text(&media::app_name(&s.id), &fo.hdr, x + 64.0, y + 15.0, w - 78.0, 20.0, 0.85);
+                c.text(if s.playing { "Playing" } else { "Paused" }, &fo.small, x + 64.0, y + 35.0, w - 78.0, 16.0, 0.45);
+                c.text(&s.title, &fo.title, x + 14.0, y + 70.0, w - 28.0, 22.0, 1.0);
+                c.text(&s.artist, &fo.body, x + 14.0, y + 94.0, w - 28.0, 18.0, 0.6);
+                let (px, py) = (x + w - 34.0, y + h - 34.0);
+                if s.dur > 0.0 {
+                    let bw = w - 28.0 - 50.0;
+                    c.rrect(x + 14.0, py - 1.5, bw, 3.0, 1.5, 0.16);
+                    c.rrect(x + 14.0, py - 1.5, bw * frac, 3.0, 1.5, 0.8);
+                }
+                c.circle(px, py, 18.0, if hot { 1.0 } else { 0.85 });
+                c.ink(glyph, &fo.icon, px - 18.0, py - 18.0, 36.0, 36.0, 1.0);
+            } else {
+                c.rrect(x + 12.0, y + 12.0, 48.0, 48.0, 12.0, 0.1);
+                c.text("\u{E8D6}", &fo.icon_big, x + 12.0, y + 12.0, 48.0, 48.0, 0.75);
+                let tw = w - 72.0 - 56.0;
+                c.text(&s.title, &fo.hdr, x + 72.0, y + 10.0, tw, 20.0, 1.0);
+                c.text(&s.artist, &fo.body, x + 72.0, y + 29.0, tw, 16.0, 0.6);
+                c.text(&status, &fo.small, x + 72.0, y + 46.0, tw, 16.0, 0.4);
+                if s.dur > 0.0 {
+                    c.rrect(x + 16.0, y + h - 6.0, (w - 32.0) * frac, 2.0, 1.0, 0.5);
+                }
+                let (px, py) = (x + w - 32.0, y + h / 2.0);
+                c.circle(px, py, 18.0, if hot { 1.0 } else { 0.85 });
+                c.ink(glyph, &fo.icon, px - 18.0, py - 18.0, 36.0, 36.0, 1.0);
+            }
         }
         Ok(())
     }
@@ -1061,9 +1130,9 @@ impl Island {
                 return h;
             }
         }
-        if (l.sec_x..l.sec_x + l.sec_w).contains(&x) && y >= l.sec_y {
-            let i = ((y - l.sec_y) / 40.0) as usize;
-            if i < l.sec_n && (y - l.sec_y) - 40.0 * i as f32 <= 36.0 && i + 1 < self.media_len() {
+        for i in 0..self.tiles.min(self.media_len().saturating_sub(1)) {
+            let (tx, ty, tw, th) = self.tile(i);
+            if (tx..tx + tw).contains(&x) && (ty..ty + th).contains(&y) {
                 return Hover::Sec(i);
             }
         }
@@ -1116,6 +1185,7 @@ impl Island {
                 }
                 WM_MEDIA => {
                     if self.mode != Mode::Hidden {
+                        self.sync_tiles();
                         self.touch();
                     }
                 }
@@ -1160,6 +1230,9 @@ impl Island {
                         Hover::Tab(t) => {
                             self.tab = t;
                             self.hover = Hover::None;
+                            if self.shown {
+                                self.place();
+                            }
                         }
                         Hover::Prev => {
                             if let Some((id, _)) = self.primary() {

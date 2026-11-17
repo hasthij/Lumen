@@ -20,7 +20,7 @@ pub fn number_with(src: &str, lookup: Lookup) -> Option<f64> {
 }
 
 pub fn eval_with(src: &str, lookup: Lookup) -> Option<f64> {
-    let mut p = Parser { s: src.as_bytes(), i: 0, lookup };
+    let mut p = Parser { s: src.as_bytes(), i: 0, depth: 0, lookup };
     let v = p.expr()?;
     p.ws();
     (p.i == p.s.len()).then_some(v).filter(|v| v.is_finite())
@@ -29,6 +29,7 @@ pub fn eval_with(src: &str, lookup: Lookup) -> Option<f64> {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: u32,
     lookup: Lookup<'a>,
 }
 
@@ -82,20 +83,33 @@ impl Parser<'_> {
     fn power(&mut self) -> Option<f64> {
         let base = self.unary()?;
         if self.eat(b'^') {
-            Some(base.powf(self.power()?))
+            if self.depth >= 64 {
+                return None;
+            }
+            self.depth += 1;
+            let e = self.power();
+            self.depth -= 1;
+            Some(base.powf(e?))
         } else {
             Some(base)
         }
     }
 
     fn unary(&mut self) -> Option<f64> {
-        if self.eat(b'-') {
-            return Some(-self.unary()?);
+        // Nesting guard: a skin with thousands of "(" or "-" must not overflow the stack.
+        if self.depth >= 64 {
+            return None;
         }
-        if self.eat(b'+') {
-            return self.unary();
-        }
-        self.atom()
+        self.depth += 1;
+        let r = if self.eat(b'-') {
+            self.unary().map(|v| -v)
+        } else if self.eat(b'+') {
+            self.unary()
+        } else {
+            self.atom()
+        };
+        self.depth -= 1;
+        r
     }
 
     fn atom(&mut self) -> Option<f64> {
@@ -184,6 +198,14 @@ fn call(name: &str, a: &[f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_nesting_is_rejected_not_crashed() {
+        assert_eq!(eval(&format!("{}1{}", "(".repeat(5000), ")".repeat(5000))), None);
+        assert_eq!(eval(&format!("{}1", "-".repeat(5000))), None);
+        assert_eq!(eval(&format!("1{}", "^1".repeat(5000))), None);
+        assert_eq!(eval("((1+2)*3)"), Some(9.0));
+    }
 
     #[test]
     fn formulas() {

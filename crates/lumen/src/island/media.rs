@@ -128,7 +128,9 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
     let mut slots: Vec<Slot> = Vec::new();
     let mut last_n = usize::MAX;
     let mut last_track: Option<(String, String)> = None;
-    let mut last_playing = false;
+    let mut last_playing;
+    let mut last_primary = String::new();
+    let mut sp_pid = 0u32;
     // Cover for the Spotify stand-in, looked up on a helper thread once per track.
     let fb_art: Arc<Mutex<Option<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(None));
     let mut fb_key = String::new();
@@ -200,8 +202,9 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
                 }
             }
         }
-        if sessions.is_empty() {
-            if let Some(t) = spotify_title() {
+        // Spotify often registers no Windows media session; read its window unless it has one.
+        if !sessions.iter().any(|(i, _)| i.to_ascii_lowercase().contains("spotify")) {
+            if let Some(t) = spotify_title(&mut sp_pid) {
                 if let Some(tr) = t {
                     last_track = Some(tr);
                     last_playing = true;
@@ -233,6 +236,11 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
                     fresh.push(Media { id: FALLBACK.into(), title, artist, playing: last_playing, pos: 0.0, dur: 0.0, at: Instant::now(), art, art_gen: fb_gen });
                 }
             }
+        }
+        // Playing first; when nothing plays, the source that played last stays on top.
+        fresh.sort_by_key(|m| (!m.playing, m.id != last_primary));
+        if let Some(m) = fresh.first().filter(|m| m.playing) {
+            last_primary.clone_from(&m.id);
         }
         let changed = {
             let mut m = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -272,16 +280,50 @@ fn fetch_cover(query: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Readable app name for a session id (AUMID or exe path). Browsers registered under a random
+/// id (e.g. "2PXGTUECDQ...") show as "Browser".
+pub fn app_name(id: &str) -> String {
+    let l = id.to_ascii_lowercase();
+    for (k, n) in [("spotify", "Spotify"), ("brave", "Brave"), ("chrome", "Chrome"), ("msedge", "Edge"), ("firefox", "Firefox"), ("opera", "Opera"), ("vivaldi", "Vivaldi"), ("zunemusic", "Media Player"), ("vlc", "VLC"), ("discord", "Discord")] {
+        if l.contains(k) {
+            return n.into();
+        }
+    }
+    let last = id.rsplit(['!', '\\', '.']).find(|p| !p.is_empty() && !p.eq_ignore_ascii_case("exe")).unwrap_or("");
+    let random = last.len() >= 16 && last.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if last.is_empty() {
+        "Media".into()
+    } else if random {
+        "Browser".into()
+    } else {
+        last.into()
+    }
+}
+
 /// Id of the stand-in session used when Windows lists no media session but Spotify is running.
 const FALLBACK: &str = "spotify:window";
 
 /// Spotify's window title is "Artist - Song" while playing and "Spotify ..." otherwise.
 /// Returns (title, artist) when playing, Some(None) when Spotify runs but is idle, None when it does not run.
-fn spotify_title() -> Option<Option<(String, String)>> {
+/// `pid` caches Spotify's process so later ticks skip opening every window's process.
+fn spotify_title(pid: &mut u32) -> Option<Option<(String, String)>> {
+    if *pid != 0 {
+        if let r @ Some(_) = scan_impl(*pid, &mut 0) {
+            return r;
+        }
+    }
+    *pid = 0;
+    scan_impl(0, pid)
+}
+
+/// `want` != 0: only windows of that process. Otherwise matches by exe name and stores the pid in `found_pid`.
+fn scan_impl(want: u32, found_pid: &mut u32) -> Option<Option<(String, String)>> {
     use windows::Win32::Foundation::{CloseHandle, BOOL, TRUE};
     use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId};
     struct Acc {
+        want: u32,
+        pid: u32,
         running: bool,
         found: Option<String>,
     }
@@ -289,32 +331,44 @@ fn spotify_title() -> Option<Option<(String, String)>> {
         let acc = &mut *(lp.0 as *mut Acc);
         let mut pid = 0u32;
         GetWindowThreadProcessId(h, Some(&mut pid));
-        let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return TRUE };
-        let mut buf = [0u16; 520];
-        let mut n = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
-        let _ = CloseHandle(p);
-        if !ok || !String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase().ends_with("\\spotify.exe") {
-            return TRUE;
+        if acc.want != 0 {
+            if pid != acc.want {
+                return TRUE;
+            }
+        } else {
+            // Cheap title check first: Spotify's top windows always have a title.
+            if GetWindowTextLengthW(h) == 0 {
+                return TRUE;
+            }
+            let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return TRUE };
+            let mut buf = [0u16; 520];
+            let mut n = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+            let _ = CloseHandle(p);
+            if !ok || !String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase().ends_with("\\spotify.exe") {
+                return TRUE;
+            }
         }
         let mut t = [0u16; 512];
         let len = GetWindowTextW(h, &mut t).max(0) as usize;
         let title = String::from_utf16_lossy(&t[..len]);
         if !title.is_empty() {
             acc.running = true;
+            acc.pid = pid;
             if title.contains(" - ") && acc.found.is_none() {
                 acc.found = Some(title);
             }
         }
         TRUE
     }
-    let mut acc = Acc { running: false, found: None };
+    let mut acc = Acc { want, pid: 0, running: false, found: None };
     unsafe {
         let _ = EnumWindows(Some(cb), LPARAM(&mut acc as *mut Acc as isize));
     }
     if !acc.running {
         return None;
     }
+    *found_pid = acc.pid;
     Some(acc.found.and_then(|t| t.split_once(" - ").map(|(a, s)| (s.trim().to_string(), a.trim().to_string()))))
 }
 
@@ -368,8 +422,7 @@ fn read(s: &Session, slot: &mut Slot) -> Option<Media> {
     let artist = props.Artist().map(|a| a.to_string()).unwrap_or_default();
     if title.is_empty() && artist.is_empty() {
         // Still show the app so the panel binds to it and its controls work.
-        let app = slot.id.rsplit(['!', '\\', '.']).find(|p| !p.is_empty() && *p != "exe").unwrap_or("Media");
-        title = app.to_string();
+        title = app_name(&slot.id);
     }
     let playing = s.GetPlaybackInfo().and_then(|p| p.PlaybackStatus()).map(|p| p == Status::Playing).unwrap_or(false);
     let (mut pos, mut dur) = (0.0, 0.0);
