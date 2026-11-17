@@ -11,6 +11,7 @@ mod clock;
 mod config;
 mod gfx;
 mod icon;
+mod island;
 mod launcher;
 #[macro_use]
 mod log;
@@ -57,6 +58,7 @@ fn main() {
         let page = match args.get(i + 1).map(String::as_str) {
             Some("clock") | Some("skins") => settings::Page::Skins,
             Some("appearance") => settings::Page::Appearance,
+            Some("island") => settings::Page::Island,
             Some("taskbar") => settings::Page::Taskbar,
             Some("launcher") => settings::Page::Launcher,
             Some("about") => settings::Page::About,

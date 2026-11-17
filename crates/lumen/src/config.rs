@@ -18,6 +18,7 @@ pub struct Config {
     pub launcher: LauncherConfig,
     pub appearance: Appearance,
     pub taskbar: TaskbarConfig,
+    pub island: IslandConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,62 @@ pub struct Modules {
     pub clock: bool,
     pub launcher: bool,
     pub taskbar: bool,
+    pub island: bool,
+}
+
+/// The clipboard + media island docked to a screen edge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IslandConfig {
+    /// "left", "right" or "top".
+    pub side: String,
+    /// Size multiplier on top of display scaling, 0.7-2.0.
+    pub scale: f32,
+    /// "none", "fade", "slide_up", "slide_down" or "zoom"; "liquid" is the spring pull.
+    pub animation: String,
+    /// Animation length in ms, 0-400 (0 = instant).
+    pub animation_ms: u32,
+    /// Background as #RRGGBB.
+    pub bg: String,
+    /// Background opacity, 0.4-1.0.
+    pub opacity: f32,
+    /// Thin light outline around the island.
+    pub outline: bool,
+    /// Days of clipboard history kept, 1-30.
+    pub history_days: u32,
+}
+
+impl Default for IslandConfig {
+    fn default() -> Self {
+        Self {
+            side: "right".into(),
+            scale: 1.0,
+            animation: "liquid".into(),
+            animation_ms: 220,
+            bg: "#000000".into(),
+            opacity: 0.92,
+            outline: true,
+            history_days: 7,
+        }
+    }
+}
+
+impl IslandConfig {
+    pub fn clamp(&mut self) {
+        if !matches!(self.side.as_str(), "left" | "right" | "top") {
+            self.side = "right".into();
+        }
+        if !matches!(self.animation.as_str(), "none" | "liquid" | "fade" | "zoom") {
+            self.animation = "liquid".into();
+        }
+        self.scale = self.scale.clamp(0.7, 2.0);
+        self.animation_ms = self.animation_ms.clamp(0, 400);
+        self.opacity = self.opacity.clamp(0.4, 1.0);
+        self.history_days = self.history_days.clamp(1, 30);
+        if self.bg.len() != 7 || !self.bg.starts_with('#') || u32::from_str_radix(&self.bg[1..], 16).is_err() {
+            self.bg = "#000000".into();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,13 +173,14 @@ impl Default for Config {
             launcher: LauncherConfig::default(),
             appearance: Appearance::default(),
             taskbar: TaskbarConfig::default(),
+            island: IslandConfig::default(),
         }
     }
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Self { clock: true, launcher: true, taskbar: false }
+        Self { clock: true, launcher: true, taskbar: false, island: false }
     }
 }
 
@@ -272,6 +330,7 @@ impl Config {
             Ok(text) => match toml::from_str::<Config>(&text) {
                 Ok(mut cfg) => {
                     cfg.launcher.fill_defaults();
+                    cfg.island.clamp();
                     cfg.migrate_skins(&text);
                     cfg
                 }

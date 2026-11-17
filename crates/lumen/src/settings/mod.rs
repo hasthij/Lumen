@@ -36,6 +36,7 @@ pub enum Page {
     Appearance,
     Skins,
     Launcher,
+    Island,
     Taskbar,
     About,
 }
@@ -45,6 +46,7 @@ const PAGES: &[(Page, &str, char)] = &[
     (Page::Appearance, "Appearance", '\u{E790}'),
     (Page::Skins, "Skins", '\u{E8B7}'),
     (Page::Launcher, "Launcher", '\u{E721}'),
+    (Page::Island, "Island", '\u{E7F4}'),
     (Page::Taskbar, "Taskbar", '\u{E7C4}'),
     (Page::About, "About", '\u{E946}'),
 ];
@@ -79,6 +81,9 @@ enum Slider {
     ClockOpacity,
     LauncherScale,
     AnimSpeed,
+    IslandScale,
+    IslandAnimMs,
+    IslandOpacity,
     ClockHue,
     ClockSat,
     TbOpacity(Sit),
@@ -104,6 +109,10 @@ enum Hit {
     OpenSkins,
     WebFallback,
     Animation(&'static str),
+    IslandSide(&'static str),
+    IslandAnim(&'static str),
+    IslandBg(u32),
+    IslandOutline,
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -360,6 +369,9 @@ impl Settings {
             Slider::ClockOpacity => (self.sel().opacity - 0.1) / 0.9,
             Slider::LauncherScale => (self.cfg.launcher.scale - 0.7) / 1.3,
             Slider::AnimSpeed => self.cfg.launcher.animation_ms as f32 / 400.0,
+            Slider::IslandScale => (self.cfg.island.scale - 0.7) / 1.3,
+            Slider::IslandAnimMs => self.cfg.island.animation_ms as f32 / 400.0,
+            Slider::IslandOpacity => (self.cfg.island.opacity - 0.4) / 0.6,
             Slider::ClockHue => hsv_of(&self.sel().color, [1.0; 3]).0 / 360.0,
             Slider::ClockSat => hsv_of(&self.sel().color, [1.0; 3]).1,
             Slider::TbOpacity(s) => self.look(s).opacity,
@@ -392,6 +404,9 @@ impl Settings {
             }
             Slider::LauncherScale => self.cfg.launcher.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
             Slider::AnimSpeed => self.cfg.launcher.animation_ms = ((t * 400.0 / 10.0).round() * 10.0) as u32,
+            Slider::IslandScale => self.cfg.island.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
+            Slider::IslandAnimMs => self.cfg.island.animation_ms = ((t * 40.0).round() * 10.0) as u32,
+            Slider::IslandOpacity => self.cfg.island.opacity = ((0.4 + t * 0.6) * 100.0).round() / 100.0,
             Slider::ClockHue | Slider::ClockSat => {
                 let (h, sat, _) = hsv_of(&self.sel().color, [1.0; 3]);
                 let (h, sat) = if s == Slider::ClockHue { (t * 360.0, sat.max(0.35)) } else { (h, t) };
@@ -415,6 +430,9 @@ impl Settings {
             Slider::ClockOpacity => format!("{}%", (self.sel().opacity * 100.0).round()),
             Slider::LauncherScale => format!("{}%", (self.cfg.launcher.scale * 100.0).round()),
             Slider::AnimSpeed => format!("{} ms", self.cfg.launcher.animation_ms),
+            Slider::IslandScale => format!("{}%", (self.cfg.island.scale * 100.0).round()),
+            Slider::IslandAnimMs => format!("{} ms", self.cfg.island.animation_ms),
+            Slider::IslandOpacity => format!("{}%", (self.cfg.island.opacity * 100.0).round()),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -458,8 +476,25 @@ impl Settings {
                     "clock" => self.cfg.modules.clock = !self.cfg.modules.clock,
                     "launcher" => self.cfg.modules.launcher = !self.cfg.modules.launcher,
                     "taskbar" => self.cfg.modules.taskbar = !self.cfg.modules.taskbar,
+                    "island" => self.cfg.modules.island = !self.cfg.modules.island,
                     _ => {}
                 }
+                self.commit_config();
+            }
+            Hit::IslandSide(id) => {
+                self.cfg.island.side = id.into();
+                self.commit_config();
+            }
+            Hit::IslandAnim(id) => {
+                self.cfg.island.animation = id.into();
+                self.commit_config();
+            }
+            Hit::IslandBg(c) => {
+                self.cfg.island.bg = theme::to_hex(theme::rgb(c));
+                self.commit_config();
+            }
+            Hit::IslandOutline => {
+                self.cfg.island.outline = !self.cfg.island.outline;
                 self.commit_config();
             }
             Hit::Animation(id) => {
@@ -923,6 +958,7 @@ impl Settings {
             Page::Appearance => ("Appearance", "Theme colour and backdrop for Lumen's windows"),
             Page::Skins => ("Skins", "Choose which Rainmeter skins stay on your desktop"),
             Page::Launcher => ("Launcher", "Search apps, files, settings and more"),
+            Page::Island => ("Island", "Clipboard history and media, docked to a screen edge"),
             Page::Taskbar => ("Taskbar", "Clear or tinted taskbar, by situation"),
             Page::About => ("About", "Lumen"),
         };
@@ -936,6 +972,7 @@ impl Settings {
             Page::Appearance => self.page_appearance(top),
             Page::Skins => self.page_skins(top),
             Page::Launcher => self.page_launcher(top),
+            Page::Island => self.page_island(top),
             Page::Taskbar => self.page_taskbar(top),
             Page::About => self.page_about(top),
         };
@@ -1124,9 +1161,10 @@ impl Settings {
         y += 68.0 + 24.0;
 
         y = self.section("Modules", y);
-        let modules: [(&'static str, char, &str, &str, bool); 3] = [
+        let modules: [(&'static str, char, &str, &str, bool); 4] = [
             ("clock", '\u{E8B7}', "Skins", "Rainmeter skins on your desktop", self.cfg.modules.clock),
             ("launcher", '\u{E721}', "Launcher", "PowerToys Run replacement", self.cfg.modules.launcher),
+            ("island", '\u{E7F4}', "Island", "Clipboard history and media dock", self.cfg.modules.island),
             ("taskbar", '\u{E7C4}', "Clear taskbar", "TranslucentTB replacement", self.cfg.modules.taskbar),
         ];
         for (id, g, name, desc, on) in modules {
@@ -1345,6 +1383,53 @@ impl Settings {
             self.canvas.text(&note, Rect::new(x - 84.0, y + 22.0, 76.0, 24.0), Font::Text, 13.0, 500, rgba(0.42, 0.85, 0.55, 1.0), Align::Left);
         }
         y + 68.0
+    }
+
+    fn page_island(&mut self, mut y: f32) -> f32 {
+        let right = RIGHT;
+        y = self.section("Island", y);
+        self.card(y, 68.0, Some(('\u{E7F4}', None)), "Island", "Hidden until the cursor reaches the screen edge");
+        self.toggle(right, y + 34.0, self.cfg.modules.island, Hit::Module("island"), true);
+        y += 72.0;
+
+        self.card(y, 68.0, Some(('\u{E7C9}', None)), "Dock side", "Which screen edge it grows from");
+        let sides: [(&'static str, &str); 3] = [("left", "Left"), ("top", "Top"), ("right", "Right")];
+        let opts: Vec<(&str, Hit)> = sides.iter().map(|(id, n)| (*n, Hit::IslandSide(id))).collect();
+        let sel = sides.iter().position(|(id, _)| *id == self.cfg.island.side).unwrap_or(2);
+        self.segmented(right, y + 34.0, &opts, sel);
+        y += 72.0;
+
+        self.card(y, 68.0, Some(('\u{E740}', None)), "Size", "Scales the whole island, text and art");
+        let v = self.slider_label(Slider::IslandScale);
+        self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::IslandScale, None);
+        self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+        y += 72.0 + 20.0;
+
+        y = self.section("Animation", y);
+        self.card(y, 68.0, Some(('\u{E7AC}', None)), "Style", "Liquid pulls out of the edge like a drop");
+        let styles: [(&'static str, &str); 4] = [("liquid", "Liquid"), ("fade", "Fade"), ("zoom", "Zoom"), ("none", "None")];
+        let opts: Vec<(&str, Hit)> = styles.iter().map(|(id, n)| (*n, Hit::IslandAnim(id))).collect();
+        let sel = styles.iter().position(|(id, _)| *id == self.cfg.island.animation).unwrap_or(0);
+        self.segmented(right, y + 34.0, &opts, sel);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E916}', None)), "Speed", "Shorter is snappier; 0 turns the animation off");
+        let v = self.slider_label(Slider::IslandAnimMs);
+        self.slider(RIGHT - 366.0, y + 34.0, 300.0, Slider::IslandAnimMs, None);
+        self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+        y += 72.0 + 20.0;
+
+        y = self.section("Look", y);
+        self.card(y, 108.0, Some(('\u{E771}', None)), "Background", "Pure black, or any colour");
+        let current = theme::parse_hex(&self.cfg.island.bg).unwrap_or([0.0; 3]);
+        let mut x = CONTENT_X + 74.0;
+        let cy = y + 84.0;
+        for &sw in SWATCHES {
+            let c = theme::rgb(sw);
+            let selected = theme::to_hex(current) == theme::to_hex(c);
+            self.swatch(x, cy, rgba(c[0], c[1], c[2], 1.0), selected, Hit::IslandBg(sw));
+            x += 34.0;
+        }
+        y + 108.0
     }
 
     fn page_launcher(&mut self, mut y: f32) -> f32 {

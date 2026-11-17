@@ -41,15 +41,7 @@ dependencies = [
  "serde",
  "toml",
  "windows",
-]
-
-[[package]]
-name = "lumen-bar"
-version = "0.1.0"
-dependencies = [
- "serde",
- "toml",
- "windows",
+ "windows-core",
 ]
 
 [[package]]

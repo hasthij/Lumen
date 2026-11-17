@@ -14,10 +14,18 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 
+# The `implement` macro (island drag source) expands to paths under this crate.
+windows-core = "0.58"
+
 [dependencies.windows]
 version = "0.58"
 features = [
+  "implement",
+  "Foundation",
+  "Foundation_Collections",
   "Foundation_Numerics",
+  "Media_Control",
+  "Storage_Streams",
   "Win32_Foundation",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",

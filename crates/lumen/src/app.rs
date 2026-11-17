@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::clock::Clock;
 use crate::config::ClockConfig;
 use crate::config::Config;
+use crate::island::Island;
 use crate::launcher::Launcher;
 use crate::settings::{Change, Settings, Status};
 use crate::taskbar::{Taskbar, WM_TASKBAR_EVENT};
@@ -53,7 +54,7 @@ fn desktop_in_front() -> Option<bool> {
             // foreground window; it must not count as "an app is in front", or the clock
             // would drop behind the desktop while the menu is open.
             c if c.starts_with('#') => None,
-            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "ForegroundStaging" | "LumenLauncher" | "LumenSettings" | "LumenApp" | "" => None,
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "ForegroundStaging" | "LumenLauncher" | "LumenIsland" | "LumenSettings" | "LumenApp" | "" => None,
             _ => {
                 // Tool windows, tooltips and similar helpers aren't apps either.
                 let ex = GetWindowLongPtrW(fg, GWL_EXSTYLE) as u32;
@@ -78,6 +79,7 @@ const CMD_TASKBAR: usize = 107;
 const CMD_RESTORE_TASKBAR: usize = 108;
 const CMD_OPEN_CONFIG: usize = 102;
 const CMD_OPEN_LOG: usize = 103;
+const CMD_ISLAND: usize = 109;
 const CMD_QUIT: usize = 199;
 
 thread_local! {
@@ -90,6 +92,7 @@ pub struct App {
     /// One window per skin that is switched on.
     skins: Vec<Clock>,
     launcher: Option<Launcher>,
+    island: Option<Island>,
     settings: Option<Settings>,
     taskbar: Option<Taskbar>,
     /// Why the taskbar module last stopped on its own, shown in settings.
@@ -110,7 +113,7 @@ pub fn run(open_settings: bool) -> Result<()> {
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
     };
     let cfg = Config::load();
-    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
+    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, island: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| {
         app.add_tray();
@@ -138,6 +141,11 @@ pub fn run(open_settings: bool) -> Result<()> {
 /// Messages for the launcher window, routed to the launcher module if it is on.
 pub fn launcher_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     with_app(|app| app.launcher.as_mut().and_then(|l| l.handle(msg, wp, lp))).flatten()
+}
+
+/// Messages for the island window, routed to the island module if it is on.
+pub fn island_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    with_app(|app| app.island.as_mut().and_then(|i| i.handle(msg, wp, lp))).flatten()
 }
 
 /// Messages for the settings window. Changes it makes are applied right after.
@@ -172,6 +180,20 @@ impl App {
             (false, true) => {
                 self.taskbar = None;
                 crate::info!("taskbar module off");
+            }
+            _ => {}
+        }
+        match (self.cfg.modules.island, self.island.is_some()) {
+            (true, false) => match Island::create(&self.cfg.island) {
+                Ok(i) => {
+                    self.island = Some(i);
+                    crate::info!("island module on");
+                }
+                Err(e) => crate::error!("island module failed to start: {e}"),
+            },
+            (false, true) => {
+                self.island = None;
+                crate::info!("island module off");
             }
             _ => {}
         }
@@ -283,6 +305,9 @@ impl App {
         }
         if let Some(t) = self.taskbar.as_mut() {
             t.set_config(&self.cfg.taskbar);
+        }
+        if let Some(i) = self.island.as_mut() {
+            i.set_config(&self.cfg.island);
         }
     }
 
@@ -466,6 +491,7 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.clock), CMD_CLOCK, w!("Skins"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.launcher), CMD_LAUNCHER, w!("Launcher"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.taskbar), CMD_TASKBAR, w!("Clear taskbar"));
+            let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.island), CMD_ISLAND, w!("Island"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD, w!("Reload skin"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open settings file"));
@@ -504,6 +530,12 @@ impl App {
                 self.cfg.modules.launcher = !self.cfg.modules.launcher;
                 self.cfg.save();
                 self.apply_modules();
+            }
+            CMD_ISLAND => {
+                self.cfg.modules.island = !self.cfg.modules.island;
+                self.cfg.save();
+                self.apply_modules();
+                self.sync_settings();
             }
             CMD_OPEN_LAUNCHER => {
                 if let Some(l) = self.launcher.as_mut() {

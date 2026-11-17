@@ -32,7 +32,6 @@ Crates:
 - `crates/lumen`: the app (clock, launcher, settings, taskbar controller)
 - `crates/lumen-tap`: a small DLL loaded into Explorer that changes the taskbar's XAML fill (the technique TranslucentTB uses)
 - `crates/lumen-setup`: the self-contained installer and uninstaller
-- `crates/lumen-bar`: an early macOS-style dock prototype (not part of the release)
 
 Useful switches: `--settings`, `--launcher`, `--restore`, `--uninstall`. The `dev-logs` cargo feature writes logs to a repo folder.
 
