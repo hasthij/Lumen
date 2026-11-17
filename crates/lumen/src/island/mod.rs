@@ -955,9 +955,11 @@ impl Island {
                 let d = rect(ox + l.art.0, oy + l.art.1, l.art.2, l.art.2);
                 // Fill a rounded rect with the cover so the corners are soft; plain bitmap if the brush fails.
                 let sz = bmp.GetSize();
-                let k = l.art.2 / sz.width.max(1.0);
+                // Cover-fit: scale the short side to the square and centre-crop the long side (no stretch).
+                let k = l.art.2 / sz.width.min(sz.height).max(1.0);
+                let (dx, dy) = ((l.art.2 - sz.width * k) / 2.0, (l.art.2 - sz.height * k) / 2.0);
                 let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
-                let brp = D2D1_BRUSH_PROPERTIES { opacity: alpha, transform: Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: d.left, M32: d.top } };
+                let brp = D2D1_BRUSH_PROPERTIES { opacity: alpha, transform: Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: d.left + dx, M32: d.top + dy } };
                 match rt.CreateBitmapBrush(bmp, Some(&bp), Some(&brp)) {
                     Ok(b) => rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: d, radiusX: 14.0, radiusY: 14.0 }, &b),
                     Err(_) => rt.DrawBitmap(bmp, Some(&d), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
