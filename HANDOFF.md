@@ -1,7 +1,10 @@
-# Lumen handoff (2026-11-18)
-- Pushed up to 513ede5; everything below is uncommitted. Release needs GitHub asset LumenSetup.exe (tag vX.Y.Z) for the update check.
-- Done: drag-out of text/files (user-verified), file size on rows, Spotify detection via audio peak + iTunes timeline, vector media icons.
-- Tuned UI applied: PAD 26, body font 13, tabs (gap 4, r16), row 42/gap 6/r16, icon 30/r12, media buttons rounded squares (BTN 40, r7), row hover lift 1.5px + press squash 0.95 eased over animation_ms. Skipped: buttons/tiles have no hover animation, tab widths fixed (96/76).
-- New: Settings > Island > "Paste on click" (default off) sends Ctrl+V after a row click (SendInput; island never takes focus).
-- Build/test pass (12 tests). NOT checked on screen: row/button look, paste-on-click, Spotify, file sizes. rust-reviewer skipped.
-- Tomorrow: optimization check (idle CPU/RAM, repaint, timers, caches); feature check across modules.
+﻿Island: smoother motion.
+- Open/close spring slower (x2.6) + bouncier (zeta .68, liquid .42); content scales 0.88->1 while fading in.
+- Tab switch: body slides/fades in (tab_a).
+- Clipboard scroll: eased scroll_f, rows drawn at sub-row offset, clipped.
+- Paste on click default true; top bar fits width 450-640.
+- Not done: perf/lag audit, extra customization settings.
+
+- Copy nudge: on clipboard capture while hidden, island shows Peek pill ~1.3s then retracts (nudge_until in island/mod.rs). Vsync pacer (DwmFlush thread -> WM_FRAME) drives 144Hz animation. Not verified by eye.
+
+- Island settings page now has: copy nudge toggle + length (default 700ms), history days, opacity, outline.

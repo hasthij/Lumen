@@ -84,6 +84,8 @@ enum Slider {
     IslandScale,
     IslandAnimMs,
     IslandOpacity,
+    IslandNudgeMs,
+    IslandHistory,
     ClockHue,
     ClockSat,
     TbOpacity(Sit),
@@ -114,6 +116,7 @@ enum Hit {
     IslandAnim(&'static str),
     IslandBg(u32),
     IslandOutline,
+    IslandNudge,
     IslandPaste,
     Engine(&'static str),
     Slider(Slider, Rect),
@@ -374,6 +377,8 @@ impl Settings {
             Slider::IslandScale => (self.cfg.island.scale - 0.7) / 1.3,
             Slider::IslandAnimMs => self.cfg.island.animation_ms as f32 / 400.0,
             Slider::IslandOpacity => (self.cfg.island.opacity - 0.4) / 0.6,
+            Slider::IslandNudgeMs => (self.cfg.island.nudge_ms as f32 - 300.0) / 2700.0,
+            Slider::IslandHistory => (self.cfg.island.history_days as f32 - 1.0) / 29.0,
             Slider::ClockHue => hsv_of(&self.sel().color, [1.0; 3]).0 / 360.0,
             Slider::ClockSat => hsv_of(&self.sel().color, [1.0; 3]).1,
             Slider::TbOpacity(s) => self.look(s).opacity,
@@ -409,6 +414,8 @@ impl Settings {
             Slider::IslandScale => self.cfg.island.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
             Slider::IslandAnimMs => self.cfg.island.animation_ms = ((t * 40.0).round() * 10.0) as u32,
             Slider::IslandOpacity => self.cfg.island.opacity = ((0.4 + t * 0.6) * 100.0).round() / 100.0,
+            Slider::IslandNudgeMs => self.cfg.island.nudge_ms = (((300.0 + t * 2700.0) / 100.0).round() * 100.0) as u32,
+            Slider::IslandHistory => self.cfg.island.history_days = (1.0 + t * 29.0).round() as u32,
             Slider::ClockHue | Slider::ClockSat => {
                 let (h, sat, _) = hsv_of(&self.sel().color, [1.0; 3]);
                 let (h, sat) = if s == Slider::ClockHue { (t * 360.0, sat.max(0.35)) } else { (h, t) };
@@ -435,6 +442,8 @@ impl Settings {
             Slider::IslandScale => format!("{}%", (self.cfg.island.scale * 100.0).round()),
             Slider::IslandAnimMs => format!("{} ms", self.cfg.island.animation_ms),
             Slider::IslandOpacity => format!("{}%", (self.cfg.island.opacity * 100.0).round()),
+            Slider::IslandNudgeMs => format!("{} ms", self.cfg.island.nudge_ms),
+            Slider::IslandHistory => format!("{} d", self.cfg.island.history_days),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -497,6 +506,10 @@ impl Settings {
             }
             Hit::IslandPaste => {
                 self.cfg.island.paste_on_click = !self.cfg.island.paste_on_click;
+                self.commit_config();
+            }
+            Hit::IslandNudge => {
+                self.cfg.island.copy_nudge = !self.cfg.island.copy_nudge;
                 self.commit_config();
             }
             Hit::IslandOutline => {
@@ -1403,6 +1416,23 @@ impl Settings {
         self.toggle(right, y + 34.0, self.cfg.island.paste_on_click, Hit::IslandPaste, true);
         y += 72.0;
 
+        self.card(y, 68.0, Some(('\u{E7E7}', None)), "Copy nudge", "Pops the island out for a moment when you copy something");
+        self.toggle(right, y + 34.0, self.cfg.island.copy_nudge, Hit::IslandNudge, true);
+        y += 72.0;
+        if self.cfg.island.copy_nudge {
+            self.card(y, 68.0, Some(('\u{E916}', None)), "Nudge length", "How long it stays out before disappearing");
+            let v = self.slider_label(Slider::IslandNudgeMs);
+            self.slider(RIGHT - 366.0, y + 34.0, 300.0, Slider::IslandNudgeMs, None);
+            self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+            y += 72.0;
+        }
+
+        self.card(y, 68.0, Some(('\u{E81C}', None)), "History", "How many days of clipboard items are kept");
+        let v = self.slider_label(Slider::IslandHistory);
+        self.slider(RIGHT - 366.0, y + 34.0, 300.0, Slider::IslandHistory, None);
+        self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+        y += 72.0;
+
         self.card(y, 68.0, Some(('\u{E7C9}', None)), "Dock side", "Which screen edge it grows from");
         let sides: [(&'static str, &str); 3] = [("left", "Left"), ("top", "Top"), ("right", "Right")];
         let opts: Vec<(&str, Hit)> = sides.iter().map(|(id, n)| (*n, Hit::IslandSide(id))).collect();
@@ -1440,7 +1470,15 @@ impl Settings {
             self.swatch(x, cy, rgba(c[0], c[1], c[2], 1.0), selected, Hit::IslandBg(sw));
             x += 34.0;
         }
-        y + 108.0
+        y += 112.0;
+        self.card(y, 68.0, Some(('\u{E793}', None)), "Opacity", "How see-through the island is");
+        let v = self.slider_label(Slider::IslandOpacity);
+        self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::IslandOpacity, None);
+        self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E7B3}', None)), "Outline", "Thin light edge around the island");
+        self.toggle(right, y + 34.0, self.cfg.island.outline, Hit::IslandOutline, true);
+        y + 68.0
     }
 
     fn page_launcher(&mut self, mut y: f32) -> f32 {

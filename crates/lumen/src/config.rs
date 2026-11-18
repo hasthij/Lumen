@@ -52,6 +52,10 @@ pub struct IslandConfig {
     pub history_days: u32,
     /// Clicking a clipboard row also pastes it (Ctrl+V) into the focused app.
     pub paste_on_click: bool,
+    /// Briefly show the peek pill when something is copied.
+    pub copy_nudge: bool,
+    /// How long the copy nudge stays out, 300-3000 ms.
+    pub nudge_ms: u32,
 }
 
 impl Default for IslandConfig {
@@ -65,7 +69,9 @@ impl Default for IslandConfig {
             opacity: 0.92,
             outline: true,
             history_days: 7,
-            paste_on_click: false,
+            paste_on_click: true,
+            copy_nudge: true,
+            nudge_ms: 700,
         }
     }
 }
@@ -82,6 +88,7 @@ impl IslandConfig {
         self.animation_ms = self.animation_ms.clamp(0, 400);
         self.opacity = self.opacity.clamp(0.4, 1.0);
         self.history_days = self.history_days.clamp(1, 30);
+        self.nudge_ms = self.nudge_ms.clamp(300, 3000);
         if self.bg.len() != 7 || !self.bg.starts_with('#') || u32::from_str_radix(&self.bg[1..], 16).is_err() {
             self.bg = "#000000".into();
         }

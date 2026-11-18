@@ -28,15 +28,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 /// Ctrl+V to whatever app has focus (the island never takes focus).
+/// Runs on a short delay off the UI thread so the click finishes and the clipboard settles first;
+/// keys carry scan codes because many apps ignore virtual-key-only input.
 fn send_paste() {
-    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
-        },
-    };
-    let seq = [key(VK_CONTROL, false), key(VK_V, false), key(VK_V, true), key(VK_CONTROL, true)];
-    unsafe { SendInput(&seq, std::mem::size_of::<INPUT>() as i32) };
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        let key = |vk: VIRTUAL_KEY, scan: u16, up: bool| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
+            },
+        };
+        let seq = [key(VK_CONTROL, 0x1D, false), key(VK_V, 0x2F, false), key(VK_V, 0x2F, true), key(VK_CONTROL, 0x1D, true)];
+        unsafe { SendInput(&seq, std::mem::size_of::<INPUT>() as i32) };
+    });
 }
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
@@ -45,12 +50,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::config::IslandConfig;
 
 const WM_MEDIA: u32 = WM_APP + 1;
+const WM_FRAME: u32 = WM_APP + 2;
+static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FRAME_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const T_TICK: usize = 1;
 const T_CLIP: usize = 2;
 
 // Design units (scaled by DPI x the user's scale).
 // Content box: wide and short on the top edge, narrow and tall on the sides. Same for both tabs.
 const TOP_BOX: (f32, f32) = (900.0, 270.0);
+const TOP_MIN_W: f32 = 450.0; // top dock width of a player unless its text needs more
+const TOP_MAX_W: f32 = 640.0; // long titles grow the bar up to here, then ellipsize
 const SIDE_BOX: (f32, f32) = (360.0, 600.0);
 const F: f32 = 14.0; // fillet margin along the docked edge
 const PEEK: f32 = 0.28;
@@ -327,6 +337,8 @@ pub struct Island {
     tab: Tab,
     /// Playing sessions that get a full player (1..=MAX_PLAYERS), and paused ones shown as tiles (0..=MAX_TILES).
     players: usize,
+    /// Top-dock width of one player: half the old box, grown only when the track text needs it.
+    pw: f32,
     tiles: usize,
     /// Player being scrubbed.
     drag_p: usize,
@@ -337,6 +349,10 @@ pub struct Island {
     /// Row hover lift / press squash progress (0..1) for row `row_i`.
     row_t: f32,
     press_t: f32,
+    /// Tab-switch progress (0..1), slide direction, and the smoothly-chasing scroll offset (rows).
+    tab_a: f32,
+    tab_dir: f32,
+    scroll_f: f32,
     row_i: usize,
     row_anim: bool,
     s: f32,
@@ -347,6 +363,8 @@ pub struct Island {
     vel: f32,
     shown: bool,
     off_since: Option<Instant>,
+    /// Copy "nudge": keep the peek pill out until this instant, then retract.
+    nudge_until: Option<Instant>,
     /// When the window was hidden; the surface is freed 30 s later (kept meanwhile so reopening is instant).
     hid_at: Option<Instant>,
     peek_since: Instant,
@@ -399,6 +417,7 @@ impl Island {
                 icons: Default::default(),
                 tab: Tab::Clip,
                 players: 1,
+                pw: TOP_MIN_W,
                 tiles: 0,
                 drag_p: 0,
                 anim: Default::default(),
@@ -406,6 +425,9 @@ impl Island {
                 animating: false,
                 row_t: 0.0,
                 press_t: 0.0,
+                tab_a: 1.0,
+                tab_dir: 1.0,
+                scroll_f: 0.0,
                 row_i: 0,
                 row_anim: false,
                 s: 1.0,
@@ -416,6 +438,7 @@ impl Island {
                 vel: 0.0,
                 shown: false,
                 off_since: None,
+                nudge_until: None,
                 hid_at: None,
                 peek_since: now,
                 hover: Hover::None,
@@ -454,7 +477,8 @@ impl Island {
     fn cb(&self) -> (f32, f32) {
         let (np, t) = if self.tab == Tab::Media { (self.players.max(1), self.tiles as f32) } else { (1, 0.0) };
         if self.side == Side::Top {
-            (self.player_w() * np as f32 + t * (TILE_W + TILE_GAP), TOP_BOX.1)
+            let w = if self.tab == Tab::Media { self.player_w() * np as f32 + t * (TILE_W + TILE_GAP) } else { TOP_MIN_W };
+            (w, TOP_BOX.1)
         } else if t > 0.0 {
             (SIDE_BOX.0, SIDE_BOX.1.max(self.tiles_y() + t * (TILE_H + TILE_GAP) - TILE_GAP + 20.0))
         } else if np > 1 {
@@ -466,7 +490,7 @@ impl Island {
 
     /// Width of one player on the top dock: the full box alone, narrower when they share.
     fn player_w(&self) -> f32 {
-        if self.players.max(1) == 1 { TOP_BOX.0 } else { MULTI_W }
+        self.pw
     }
 
     /// Y where the tile column starts on a side dock.
@@ -499,13 +523,24 @@ impl Island {
         (np, (v.len() - np).min(MAX_TILES))
     }
 
+    /// Width one top-dock player needs: art + text, never below the minimum, capped per layout.
+    fn fit(v: &[media::Media], np: usize) -> f32 {
+        let est = |s: &str, per: f32| s.chars().map(|c| if c.is_ascii() { per } else { per * 1.9 }).sum::<f32>();
+        let need = v.iter().take(np).map(|m| est(&m.title, 7.4).max(est(&m.artist, 6.4)).max(150.0)).fold(0.0, f32::max);
+        let cap = if np == 1 { TOP_MAX_W } else { MULTI_W };
+        (218.0 + need + PAD + 8.0).clamp(TOP_MIN_W, cap)
+    }
+
     /// Resizes the panel when the number of players or tiles it should show changes.
     unsafe fn sync_tiles(&mut self) {
-        let (p, t) = Self::counts(&self.ordered());
+        let v = self.ordered();
+        let (p, t) = Self::counts(&v);
         let p = p.max(1);
-        if t != self.tiles || p != self.players {
+        let pw = Self::fit(&v, p);
+        if t != self.tiles || p != self.players || (pw - self.pw).abs() > 0.5 {
             self.tiles = t;
             self.players = p;
+            self.pw = pw;
             if self.tab == Tab::Media && self.shown {
                 self.place();
             }
@@ -658,6 +693,7 @@ impl Island {
     }
 
     fn timer(&mut self, ms: u32) {
+        FAST.store(ms <= 16, Ordering::Relaxed);
         if self.timer_ms != ms {
             self.timer_ms = ms;
             unsafe { SetTimer(self.hwnd, T_TICK, ms, None) };
@@ -671,6 +707,7 @@ impl Island {
         let was = self.mode;
         self.mode = m;
         self.off_since = None;
+        self.nudge_until = None;
         self.press = None;
         self.seek = None;
         unsafe {
@@ -693,6 +730,8 @@ impl Island {
         }
         if m == Mode::Open {
             self.scroll = 0;
+            self.scroll_f = 0.0;
+            self.tab_a = 1.0;
         }
         if self.instant() {
             self.v = self.target();
@@ -702,9 +741,11 @@ impl Island {
     }
 
     unsafe fn show(&mut self) {
-        let (p, t) = Self::counts(&self.ordered());
+        let v = self.ordered();
+        let (p, t) = Self::counts(&v);
         self.players = p.max(1);
         self.tiles = t;
+        self.pw = Self::fit(&v, self.players);
         self.place();
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -742,8 +783,9 @@ impl Island {
         if self.v == t && self.vel == 0.0 {
             return false;
         }
-        let omega = 6.0 / (self.cfg.animation_ms.max(1) as f32 / 1000.0);
-        let zeta = if self.cfg.animation == "liquid" { 0.6 } else { 1.0 };
+        // Slower, springier morph: the pill stretches out and settles with a little bounce.
+        let omega = 6.0 / (self.cfg.animation_ms.max(1) as f32 * 2.6 / 1000.0);
+        let zeta = if self.cfg.animation == "liquid" { 0.42 } else { 0.68 };
         let mut left = dt;
         while left > 0.0 {
             let h = left.min(0.008);
@@ -779,9 +821,27 @@ impl Island {
         let ptgt = if self.press.is_some() { 1.0 } else { 0.0 };
         let ease = |v: f32, t: f32| if instant { t } else if v < t { (v + k).min(t) } else { (v - k).max(t) };
         let (a, b) = (ease(self.row_t, tgt), ease(self.press_t, ptgt));
-        let moving = a != self.row_t || b != self.press_t;
+        let mut moving = a != self.row_t || b != self.press_t;
         self.row_t = a;
         self.press_t = b;
+        // Tab slide/fade-in.
+        if self.tab_a < 1.0 {
+            self.tab_a = if instant { 1.0 } else { (self.tab_a + dt / 0.26).min(1.0) };
+            moving = true;
+        }
+        // Smooth scroll: chase the target row offset exponentially.
+        let tgt = self.scroll as f32;
+        if self.scroll_f != tgt {
+            if instant {
+                self.scroll_f = tgt;
+            } else {
+                self.scroll_f += (tgt - self.scroll_f) * (1.0 - (-dt * 16.0).exp());
+                if (tgt - self.scroll_f).abs() < 0.01 {
+                    self.scroll_f = tgt;
+                }
+            }
+            moving = true;
+        }
         moving
     }
 
@@ -870,7 +930,10 @@ impl Island {
                 let on = inside(self.screen_rect(PEEK_EXT, PEEK_HH, 8));
                 if (on && depth >= 2) || (at_edge && now.duration_since(self.peek_since) >= Duration::from_millis(30)) {
                     self.set_mode(Mode::Open);
+                } else if !on && !at_edge && !near && self.nudge_until.is_some_and(|t| now < t) {
+                    self.off_since = None;
                 } else if !on && !at_edge && !near {
+                    self.nudge_until = None;
                     let since = *self.off_since.get_or_insert(now);
                     if now.duration_since(since) >= Duration::from_millis(250) {
                         self.set_mode(Mode::Hidden);
@@ -1014,8 +1077,8 @@ impl Island {
         let (l, t, rr, bb) = self.bounds(ext, hh);
         rt.PushAxisAlignedClip(&rect(l, t, rr - l, bb - t), D2D1_ANTIALIAS_MODE_ALIASED);
         let (ox, oy) = self.co();
-        if self.cfg.animation == "zoom" {
-            let z = 0.9 + 0.1 * alpha;
+        if self.cfg.animation != "none" && alpha < 1.0 {
+            let z = 0.88 + 0.12 * alpha;
             let (bw, bh) = self.cb();
             let (cx, cy) = (ox + bw / 2.0, oy + bh / 2.0);
             rt.SetTransform(&Matrix3x2 { M11: z, M12: 0.0, M21: 0.0, M22: z, M31: cx * (1.0 - z), M32: cy * (1.0 - z) });
@@ -1086,14 +1149,22 @@ impl Island {
         // Thin divider under the header.
         c.rrect(PAD, 49.0, bw - 2.0 * PAD, 1.0, 0.5, 0.1);
 
+        // Body slides in from the side of the tab that was picked while fading up.
+        let te = { let t = self.tab_a; 1.0 - (1.0 - t).powi(3) };
+        let alpha = alpha * te;
+        let ox = ox + (1.0 - te) * 28.0 * self.tab_dir;
+        let c = Ctx { rt, br, fg, alpha, ox, oy };
+
         if self.tab == Tab::Clip {
             let cw = bw - 2.0 * PAD;
             if self.hover == Hover::Clear {
                 c.rrect(bw - PAD - 66.0, 16.0, 66.0, 24.0, 6.0, 0.1);
             }
             c.text("Clear", &fo.center, bw - PAD - 66.0, 16.0, 66.0, 24.0, 0.6);
-            let first = self.scroll;
-            let icons: Vec<Option<ID2D1Bitmap>> = (0..self.rows())
+            let sf = self.scroll_f.max(0.0);
+            let first = sf.floor() as usize;
+            let frac = sf - first as f32;
+            let icons: Vec<Option<ID2D1Bitmap>> = (0..self.rows() + 1)
                 .map(|i| {
                     let e = self.store.items.get(first + i)?;
                     if !e.files {
@@ -1111,10 +1182,12 @@ impl Island {
             } else {
                 c.text(&format!("{} items", items.len()), &fo.small, PAD + 190.0, 14.0, 90.0, 28.0, 0.4);
             }
-            for i in 0..self.rows() {
-                let idx = self.scroll + i;
+            let lh = ROW_PITCH * self.rows() as f32;
+            rt.PushAxisAlignedClip(&rect(ox, oy + 52.0, bw, lh + 4.0), D2D1_ANTIALIAS_MODE_ALIASED);
+            for i in 0..self.rows() + 1 {
+                let idx = first + i;
                 let Some(e) = items.get(idx) else { break };
-                let y = 56.0 + ROW_PITCH * i as f32;
+                let y = 56.0 + ROW_PITCH * (i as f32 - frac);
                 let hot = self.hover == Hover::Row(idx);
                 let flashing = matches!(self.flash, Some((fi, _)) if fi == idx);
                 let lifted = idx == self.row_i && alpha >= 1.0 && (self.row_t > 0.0 || self.press_t > 0.0);
@@ -1153,6 +1226,7 @@ impl Island {
                     rt.SetTransform(&Matrix3x2::identity());
                 }
             }
+            rt.PopAxisAlignedClip();
             return Ok(());
         }
 
@@ -1394,6 +1468,11 @@ impl Island {
             if self.mode == Mode::Open {
                 self.scroll = 0;
                 self.touch();
+            } else if self.mode == Mode::Hidden && self.cfg.copy_nudge {
+                // Copy nudge: pop the peek pill briefly, then pointer() retracts it.
+                self.peek_since = Instant::now();
+                self.set_mode(Mode::Peek);
+                self.nudge_until = Some(Instant::now() + Duration::from_millis(self.cfg.nudge_ms as u64));
             }
         }
     }
@@ -1401,8 +1480,19 @@ impl Island {
     pub fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         unsafe {
             match msg {
+                WM_FRAME => {
+                    FRAME_PENDING.store(false, Ordering::Release);
+                    if FAST.load(Ordering::Relaxed) {
+                        self.tick();
+                    }
+                }
                 WM_TIMER => match wp.0 {
-                    T_TICK => self.tick(),
+                    T_TICK => {
+                        // The vsync pacer drives ticks while animating; the timer is the slow-path fallback.
+                        if !FAST.load(Ordering::Relaxed) || self.last_tick.elapsed() > Duration::from_millis(40) {
+                            self.tick()
+                        }
+                    }
                     T_CLIP => self.clip_changed(),
                     _ => return None,
                 },
@@ -1463,7 +1553,12 @@ impl Island {
                             SetCapture(self.hwnd);
                         }
                         Hover::Tab(t) => {
+                            if self.tab != t {
+                                self.tab_dir = if t == Tab::Media { 1.0 } else { -1.0 };
+                                self.tab_a = 0.0;
+                            }
                             self.tab = t;
+                            self.scroll_f = 0.0;
                             self.hover = Hover::None;
                             if self.shown {
                                 self.place();
@@ -1647,7 +1742,7 @@ unsafe fn create_window() -> Result<HWND> {
         ..Default::default()
     };
     RegisterClassExW(&class);
-    CreateWindowExW(
+    let hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         w!("LumenIsland"),
         w!("Lumen Island"),
@@ -1660,7 +1755,20 @@ unsafe fn create_window() -> Result<HWND> {
         None,
         instance,
         None,
-    )
+    )?;
+    // Vsync pacer: while animating, wake the UI thread once per display refresh (SetTimer is capped near 60 Hz).
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || loop {
+        if FAST.load(Ordering::Relaxed) {
+            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            if !FRAME_PENDING.swap(true, Ordering::AcqRel) {
+                let _ = PostMessageW(HWND(h as *mut _), WM_FRAME, WPARAM(0), LPARAM(0));
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+    Ok(hwnd)
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
