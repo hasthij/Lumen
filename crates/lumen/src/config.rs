@@ -56,6 +56,18 @@ pub struct IslandConfig {
     pub copy_nudge: bool,
     /// How long the copy nudge stays out, 300-3000 ms.
     pub nudge_ms: u32,
+    /// Clipboard pin, delete and search controls.
+    pub clip_tools: bool,
+    /// Keep copied images in the clipboard history.
+    pub clip_images: bool,
+    /// Volume and brightness sliders on the Media tab.
+    pub media_controls: bool,
+    /// Quick-launch tab (pinned apps and folders).
+    pub tab_launch: bool,
+    /// System glance tab (CPU, memory, battery).
+    pub tab_system: bool,
+    /// Sticky notes tab.
+    pub tab_shelf: bool,
 }
 
 impl Default for IslandConfig {
@@ -72,6 +84,12 @@ impl Default for IslandConfig {
             paste_on_click: true,
             copy_nudge: true,
             nudge_ms: 700,
+            clip_tools: true,
+            clip_images: false,
+            media_controls: true,
+            tab_launch: false,
+            tab_system: false,
+            tab_shelf: false,
         }
     }
 }

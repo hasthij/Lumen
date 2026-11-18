@@ -118,6 +118,7 @@ enum Hit {
     IslandOutline,
     IslandNudge,
     IslandPaste,
+    IslandFeat(&'static str),
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -510,6 +511,19 @@ impl Settings {
             }
             Hit::IslandNudge => {
                 self.cfg.island.copy_nudge = !self.cfg.island.copy_nudge;
+                self.commit_config();
+            }
+            Hit::IslandFeat(f) => {
+                let c = &mut self.cfg.island;
+                let b = match f {
+                    "tools" => &mut c.clip_tools,
+                    "images" => &mut c.clip_images,
+                    "media" => &mut c.media_controls,
+                    "launch" => &mut c.tab_launch,
+                    "system" => &mut c.tab_system,
+                    _ => &mut c.tab_shelf,
+                };
+                *b = !*b;
                 self.commit_config();
             }
             Hit::IslandOutline => {
@@ -1445,6 +1459,22 @@ impl Settings {
         self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::IslandScale, None);
         self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
         y += 72.0 + 20.0;
+
+        y = self.section("Features", y);
+        let feats: [(char, &str, &str, &'static str, bool); 6] = [
+            ('\u{E734}', "Clipboard tools", "Pin, delete and search clipboard items", "tools", self.cfg.island.clip_tools),
+            ('\u{E91B}', "Clipboard images", "Keep copied images, shown as thumbnails", "images", self.cfg.island.clip_images),
+            ('\u{E767}', "Volume and brightness", "Sound tab: per-app mixer and brightness", "media", self.cfg.island.media_controls),
+            ('\u{E71D}', "Quick launch tab", "Pinned apps and folders; drop a file on the tab to pin", "launch", self.cfg.island.tab_launch),
+            ('\u{E9D9}', "System tab", "CPU, memory and battery, updated only while open", "system", self.cfg.island.tab_system),
+            ('\u{E70B}', "Sticky notes tab", "Quick notes saved on disk", "shelf", self.cfg.island.tab_shelf),
+        ];
+        for (g, t, s, id, on) in feats {
+            self.card(y, 68.0, Some((g, None)), t, s);
+            self.toggle(right, y + 34.0, on, Hit::IslandFeat(id), true);
+            y += 72.0;
+        }
+        y += 20.0;
 
         y = self.section("Animation", y);
         self.card(y, 68.0, Some(('\u{E7AC}', None)), "Style", "Liquid pulls out of the edge like a drop");

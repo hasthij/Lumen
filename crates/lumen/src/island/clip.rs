@@ -8,9 +8,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Com::{IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
-use windows::Win32::System::Ole::{DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+use windows::Win32::System::Ole::{DoDragDrop, IDropSource, IDropSource_Impl, CF_DIB, CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{DragQueryFileW, SHCreateStdEnumFmtEtc, DROPFILES, HDROP};
 
@@ -27,6 +27,85 @@ pub struct Entry {
     /// Total bytes of the files, measured once when copied and saved with the history.
     #[serde(default)]
     pub size: u64,
+    /// Pinned entries never expire, never fall off the end, and survive Clear.
+    #[serde(default)]
+    pub pin: bool,
+    /// A copied image: `files` is true and `s` is the PNG saved next to the history.
+    #[serde(default)]
+    pub img: bool,
+}
+
+/// Most unpinned images kept on disk.
+const MAX_IMGS: usize = 20;
+/// Images larger than this are not saved.
+const MAX_IMG_BYTES: usize = 16 << 20;
+
+/// Deletes the saved picture of an image entry (only inside our own image folder).
+fn drop_img(e: &Entry) {
+    if e.img && std::path::Path::new(&e.s).starts_with(img_dir()) {
+        let _ = std::fs::remove_file(&e.s);
+    }
+}
+
+fn img_dir() -> std::path::PathBuf {
+    let mut p = crate::config::path();
+    p.set_file_name("island_img");
+    p
+}
+
+/// Saves a copied image (clipboard "PNG", else a DIB written out as .bmp) and returns its path.
+/// Skips private content and anything over 16 MB.
+pub fn read_image(owner: HWND) -> Option<String> {
+    unsafe {
+        if IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"))).is_ok() {
+            return None;
+        }
+        let png = RegisterClipboardFormatW(w!("PNG"));
+        let has_png = IsClipboardFormatAvailable(png).is_ok();
+        if !has_png && IsClipboardFormatAvailable(CF_DIB.0 as u32).is_err() {
+            return None;
+        }
+        if !open(owner) {
+            return None;
+        }
+        let bytes = (|| {
+            let h = GetClipboardData(if has_png { png } else { CF_DIB.0 as u32 }).ok()?;
+            let g = HGLOBAL(h.0);
+            let n = GlobalSize(g);
+            let p = GlobalLock(g) as *const u8;
+            if p.is_null() {
+                return None;
+            }
+            let d = std::slice::from_raw_parts(p, n.min(MAX_IMG_BYTES + 1)).to_vec();
+            let _ = GlobalUnlock(g);
+            (d.len() <= MAX_IMG_BYTES && d.len() > 40).then_some(d)
+        })();
+        let _ = CloseClipboard();
+        let mut d = bytes?;
+        let ext = if has_png {
+            "png"
+        } else {
+            // Prefix a BMP file header: pixels start after the info header, colour table and bit masks.
+            let u32_at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+            let (hs, bits, comp, used) = (u32_at(0), u16::from_le_bytes([d[14], d[15]]) as usize, u32_at(16), u32_at(32));
+            let colors = if bits <= 8 { if used > 0 { used } else { 1 << bits } } else { used };
+            let masks = if comp == 3 && hs == 40 { 12 } else { 0 };
+            let off = 14 + hs + colors * 4 + masks;
+            let mut f = Vec::with_capacity(d.len() + 14);
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&((d.len() + 14) as u32).to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&(off as u32).to_le_bytes());
+            f.extend_from_slice(&d);
+            d = f;
+            "bmp"
+        };
+        let dir = img_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        let p = dir.join(format!("{}.{ext}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()));
+        std::fs::write(&p, d).ok()?;
+        Some(p.to_string_lossy().into_owned())
+    }
 }
 
 fn files_size(s: &str) -> u64 {
@@ -82,11 +161,31 @@ impl Store {
     fn prune(&mut self) {
         let cutoff = now().saturating_sub(self.days as u64 * 86_400);
         let n = self.items.len();
-        self.items.retain(|e| e.t >= cutoff);
-        self.items.truncate(MAX_ENTRIES);
+        let (mut keep, mut imgs) = (0, 0);
+        self.items.retain(|e| {
+            keep += 1;
+            let ok = e.pin
+                || (e.t >= cutoff
+                    && keep <= MAX_ENTRIES
+                    && (!e.img || {
+                        imgs += 1;
+                        imgs <= MAX_IMGS
+                    }));
+            if !ok {
+                drop_img(e);
+            }
+            ok
+        });
         if self.items.len() != n {
             self.dirty = true;
         }
+    }
+
+    /// Adds a copied image already saved at `path`.
+    pub fn add_image(&mut self, path: String) {
+        self.items.insert(0, Entry { t: now(), files: true, size: files_size(&path), s: path, pin: false, img: true });
+        self.prune();
+        self.dirty = true;
     }
 
     pub fn add(&mut self, files: bool, s: String) {
@@ -94,21 +193,34 @@ impl Store {
             return;
         }
         // Move an existing identical entry to the top instead of duplicating it.
+        let pin = self.items.iter().any(|e| e.pin && e.files == files && e.s == s);
         self.items.retain(|e| !(e.files == files && e.s == s));
-        self.items.insert(0, Entry { t: now(), files, size: if files { files_size(&s) } else { 0 }, s });
+        self.items.insert(0, Entry { t: now(), files, size: if files { files_size(&s) } else { 0 }, s, pin, img: false });
         self.prune();
         self.dirty = true;
     }
 
+    pub fn toggle_pin(&mut self, i: usize) {
+        if let Some(e) = self.items.get_mut(i) {
+            e.pin = !e.pin;
+            self.dirty = true;
+        }
+    }
+
     pub fn remove(&mut self, i: usize) {
         if i < self.items.len() {
-            self.items.remove(i);
+            drop_img(&self.items.remove(i));
             self.dirty = true;
         }
     }
 
     pub fn clear(&mut self) {
-        self.items.clear();
+        self.items.retain(|e| {
+            if !e.pin {
+                drop_img(e);
+            }
+            e.pin
+        });
         self.dirty = true;
     }
 

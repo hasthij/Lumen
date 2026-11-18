@@ -4,6 +4,7 @@
 
 mod clip;
 mod media;
+mod mixer;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ fn send_paste() {
     });
 }
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::IslandConfig;
@@ -53,6 +54,106 @@ const WM_MEDIA: u32 = WM_APP + 1;
 const WM_FRAME: u32 = WM_APP + 2;
 static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FRAME_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// File-picker result (shelf?, paths), handed back from the dialog thread via WM_PICKED.
+const WM_PICKED: u32 = WM_APP + 3;
+static PICKED: std::sync::Mutex<Option<(bool, Vec<String>)>> = std::sync::Mutex::new(None);
+static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Brightness read back from the DDC/CI thread (WM_BRI); setter queue + busy flag (DDC/CI is slow).
+const WM_BRI: u32 = WM_APP + 4;
+static BRI_READ: std::sync::Mutex<Option<Vec<Option<f32>>>> = std::sync::Mutex::new(None);
+static BRI_SET: std::sync::Mutex<Option<(usize, f32)>> = std::sync::Mutex::new(None);
+static BRI_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Installed apps (name, path to add) for the Launch picker, scanned off the UI thread (WM_APPS).
+const WM_APPS: u32 = WM_APP + 5;
+static APPS: std::sync::Mutex<Option<Vec<(String, String)>>> = std::sync::Mutex::new(None);
+const PICK_Y: f32 = 96.0;
+const PICK_H: f32 = 40.0;
+
+fn scan_apps(hwnd: HWND) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let v = crate::launcher::apps::scan().into_iter().map(|a| (a.name, a.path.unwrap_or(a.launch))).collect();
+        *APPS.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+        let _ = PostMessageW(HWND(h as *mut _), WM_APPS, WPARAM(0), LPARAM(0));
+    });
+}
+
+fn read_brightness(hwnd: HWND) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let v = mixer::brightness_all();
+        *BRI_READ.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+        let _ = PostMessageW(HWND(h as *mut _), WM_BRI, WPARAM(0), LPARAM(0));
+    });
+}
+
+/// Mixer snapshot (apps, master) sampled off the UI thread (WM_MIX); busy flag skips overlapping polls.
+const WM_MIX: u32 = WM_APP + 6;
+static MIX: std::sync::Mutex<Option<(Vec<mixer::Chan>, Option<(f32, bool)>)>> = std::sync::Mutex::new(None);
+static MIX_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sample_mix_async(hwnd: HWND, pins: Vec<String>) {
+    if MIX_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let snap = (mixer::apps(&pins), mixer::master());
+        *MIX.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        MIX_BUSY.store(false, Ordering::Release);
+        let _ = PostMessageW(HWND(h as *mut _), WM_MIX, WPARAM(0), LPARAM(0));
+    });
+}
+
+/// Pin candidates for the mixer "+": every app with an audio session, listed off the UI thread (WM_APPS).
+fn scan_sessions(hwnd: HWND) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        *APPS.lock().unwrap_or_else(|e| e.into_inner()) = Some(mixer::sessions());
+        let _ = PostMessageW(HWND(h as *mut _), WM_APPS, WPARAM(0), LPARAM(0));
+    });
+}
+
+/// Queues an absolute brightness for monitor `i`; one worker drains the latest value so drags never pile up.
+fn push_brightness(i: usize, v: f32) {
+    *BRI_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some((i, v));
+    if BRI_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        drain_brightness()
+    });
+}
+
+fn drain_brightness() {
+    loop {
+        let next = BRI_SET.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match next {
+            Some((i, v)) => {
+                mixer::brightness(i, Some(v));
+            }
+            None => {
+                BRI_BUSY.store(false, Ordering::Release);
+                // A value queued between take() and store() would be stranded: reclaim it.
+                if BRI_SET.lock().unwrap_or_else(|e| e.into_inner()).is_none() || BRI_BUSY.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+            }
+        }
+    }
+}
 const T_TICK: usize = 1;
 const T_CLIP: usize = 2;
 
@@ -85,16 +186,54 @@ const BTN: f32 = 40.0;
 const BTN_R: f32 = 7.0;
 
 const PAD: f32 = 26.0;
+/// Sound tab geometry: track top, column width/gap, mute button size, brightness pill width.
+const SND_Y: f32 = 64.0;
+const COL_W: f32 = 56.0;
+const COL_GAP: f32 = 6.0;
+const MUTE_D: f32 = 28.0;
+const BRI_W: f32 = 64.0;
+const BRI_GAP: f32 = 10.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_R: f32 = 16.0;
 const PRESS: f32 = 0.95;
 const LIFT: f32 = 1.5;
-const TABS: [(f32, f32, Tab); 2] = [(PAD, 96.0, Tab::Clip), (PAD + 96.0 + TAB_GAP, 76.0, Tab::Media)];
+const CHIP_Y: f32 = 56.0;
+const CHIP_H: f32 = 24.0;
+const PIN_X: f32 = 64.0; // button x measured from the right edge of the row
+const DEL_X: f32 = 34.0;
+const LIST_Y: f32 = 88.0; // list top: under the tab bar and the filter strip
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Clip,
     Media,
+    Sound,
+    Launch,
+    System,
+    Shelf,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Clip => "Clip",
+            Tab::Media => "Media",
+            Tab::Sound => "Sound",
+            Tab::Launch => "Launch",
+            Tab::System => "System",
+            Tab::Shelf => "Notes",
+        }
+    }
+    fn width(self) -> f32 {
+        match self {
+            Tab::Clip => 46.0,
+            Tab::Media => 58.0,
+            Tab::Sound => 56.0,
+            Tab::Launch => 62.0,
+            Tab::System => 64.0,
+            Tab::Shelf => 54.0,
+        }
+    }
 }
 
 /// Media-tab layout in content coordinates.
@@ -134,6 +273,18 @@ enum Hover {
     Next(usize),
     Clear,
     Scrub(usize),
+    Pin(usize),
+    Del(usize),
+    Chip(u8),
+    Item(usize),
+    Add,
+    /// Sound tab: slider / mute of channel n (0 = master, i + 1 = app i), brightness pill.
+    Vol(usize),
+    Mute(usize),
+    Bri(usize),
+    /// Launch app picker: row i of the installed-app list, back button.
+    App(usize),
+    Back,
 }
 
 #[derive(Clone)]
@@ -143,6 +294,8 @@ struct Fonts {
     small: IDWriteTextFormat,
     small_r: IDWriteTextFormat,
     center: IDWriteTextFormat,
+    /// Centred bold figure inside the System gauges.
+    num: IDWriteTextFormat,
     hdr: IDWriteTextFormat,
     icon: IDWriteTextFormat,
     icon_big: IDWriteTextFormat,
@@ -171,6 +324,7 @@ impl Fonts {
             small: mk(dw, ui, 11.0, 400, l)?,
             small_r: mk(dw, ui, 11.0, 400, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             center: mk(dw, ui, 12.0, 400, c)?,
+            num: mk(dw, ui, 15.0, 600, c)?,
             hdr: mk(dw, ui, 12.0, 600, l)?,
             icon: mk(dw, ic, 15.0, 400, c)?,
             icon_big: mk(dw, ic, 22.0, 400, c)?,
@@ -226,7 +380,9 @@ fn size_label(e: &clip::Entry) -> String {
 }
 
 fn row_label(e: &clip::Entry) -> String {
-    if e.files {
+    if e.img {
+        "Image".into()
+    } else if e.files {
         let names: Vec<&str> = e.s.lines().map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p)).collect();
         match names.len() {
             0 => String::new(),
@@ -235,6 +391,93 @@ fn row_label(e: &clip::Entry) -> String {
         }
     } else {
         e.s.chars().take(200).map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
+    }
+}
+
+/// One System-tab sample.
+#[derive(Clone, Copy)]
+struct Sys {
+    cpu: f32,
+    ram: f32,
+    ram_used: u64,
+    ram_total: u64,
+    /// (percent, charging); None on desktops without a battery.
+    bat: Option<(u8, bool)>,
+    disk_free: u64,
+    disk_total: u64,
+    /// Uptime second the disk was last queried.
+    disk_at: u64,
+    uptime_s: u64,
+}
+
+fn gb(b: u64) -> String {
+    format!("{:.1} GB", b as f64 / 1073741824.0)
+}
+
+/// Quick-launch paths, mixer pins (exe stems) and sticky notes, kept beside the config.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Items {
+    #[serde(default)]
+    launch: Vec<String>,
+    #[serde(default = "default_pins")]
+    mix_pins: Vec<String>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+fn default_pins() -> Vec<String> {
+    vec!["spotify".into(), "discord".into()]
+}
+
+impl Default for Items {
+    fn default() -> Items {
+        Items { launch: Vec::new(), mix_pins: default_pins(), notes: Vec::new() }
+    }
+}
+
+impl Items {
+    fn path() -> std::path::PathBuf {
+        let mut p = crate::config::path();
+        p.set_file_name("island_items.toml");
+        p
+    }
+    fn load() -> Items {
+        std::fs::read_to_string(Self::path()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
+    }
+    fn save(&self) {
+        if let Ok(s) = toml::to_string(self) {
+            let _ = std::fs::write(Self::path(), s);
+        }
+    }
+    /// Adds launch paths (deduped, newest first) and caps the list.
+    fn add(&mut self, paths: Vec<String>) {
+        let v = &mut self.launch;
+        for p in paths {
+            v.retain(|x| !x.eq_ignore_ascii_case(&p));
+            v.insert(0, p);
+        }
+        v.truncate(12);
+        self.save();
+    }
+}
+
+/// Shelf/Launch grid tile size and pitch.
+const TILE: f32 = 72.0;
+const TILE_P: f32 = 80.0;
+
+fn open_path(p: &str) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &windows::core::HSTRING::from(p), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+fn file_name(p: &str) -> &str {
+    let t = p.trim_end_matches(['\\', '/']);
+    let n = t.rsplit(['\\', '/']).next().unwrap_or(t);
+    let n = if n.is_empty() { p } else { n };
+    match n.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && matches!(ext.to_ascii_lowercase().as_str(), "lnk" | "exe" | "url") => stem,
+        _ => n,
     }
 }
 
@@ -306,6 +549,44 @@ impl Ctx<'_> {
             }
         }
     }
+    /// Donut gauge: faint full track plus a clockwise arc from 12 o'clock covering `f` (0..1).
+    unsafe fn ring(&self, x: f32, y: f32, r: f32, w: f32, f: f32, a: f32, warn: bool) {
+        let c = D2D_POINT_2F { x: self.ox + x, y: self.oy + y };
+        self.col(0.12);
+        self.rt.DrawEllipse(&D2D1_ELLIPSE { point: c, radiusX: r, radiusY: r }, self.br, w, None);
+        let f = f.clamp(0.0, 1.0);
+        if f <= 0.002 {
+            return;
+        }
+        if warn {
+            self.br.SetColor(&color(1.0, 0.55, 0.45, a * self.alpha));
+        } else {
+            self.col(a);
+        }
+        if f >= 0.999 {
+            self.rt.DrawEllipse(&D2D1_ELLIPSE { point: c, radiusX: r, radiusY: r }, self.br, w, None);
+            return;
+        }
+        let Ok(fac) = self.rt.GetFactory() else { return };
+        let Ok(geo) = fac.CreatePathGeometry() else { return };
+        let Ok(sink) = geo.Open() else { return };
+        let ang = f * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        sink.BeginFigure(D2D_POINT_2F { x: c.x, y: c.y - r }, D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddArc(&D2D1_ARC_SEGMENT {
+            point: D2D_POINT_2F { x: c.x + r * ang.cos(), y: c.y + r * ang.sin() },
+            size: D2D_SIZE_F { width: r, height: r },
+            rotationAngle: 0.0,
+            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            arcSize: if f > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+        });
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        if sink.Close().is_err() {
+            return;
+        }
+        let cap = D2D1_STROKE_STYLE_PROPERTIES { startCap: D2D1_CAP_STYLE_ROUND, endCap: D2D1_CAP_STYLE_ROUND, ..Default::default() };
+        let style = fac.CreateStrokeStyle(&cap, None).ok();
+        self.rt.DrawGeometry(&geo, self.br, w, style.as_ref());
+    }
     unsafe fn circle(&self, x: f32, y: f32, r: f32, a: f32) {
         self.col(a);
         let e = D2D1_ELLIPSE { point: D2D_POINT_2F { x: self.ox + x, y: self.oy + y }, radiusX: r, radiusY: r };
@@ -375,8 +656,36 @@ pub struct Island {
     /// Row pressed at (screen x, y, index); becomes a drag-out once the mouse moves far enough.
     press: Option<(i32, i32, usize)>,
     scroll: usize,
+    /// Clipboard filter: 0 all, 1 text, 2 files, 3 images, 4 pinned.
+    filter: u8,
     flash: Option<(usize, Instant)>,
+    /// Wheel HUD on the media tab: (is brightness, level 0..1, when).
+    hud: Option<(bool, f32, Instant)>,
     store: clip::Store,
+    /// System glance: previous (idle, total) CPU times, last sample, and when it was taken.
+    sys_prev: (u64, u64),
+    sys: Option<Sys>,
+    sys_t: Instant,
+    /// Sound tab: playing apps, master (level, muted), brightness (None: no DDC/CI), last refresh,
+    /// slider being dragged (channel, or usize::MAX for brightness).
+    mix: Vec<mixer::Chan>,
+    master: (f32, bool),
+    /// Per-monitor brightness, left to right (None: monitor supports neither DDC/CI nor WMI).
+    bri: Vec<Option<f32>>,
+    mix_t: Instant,
+    slide: Option<usize>,
+    /// "+" app picker: open?, first visible row, cached list (None until scanned), true = mixer pins,
+    /// search query, and indexes of `apps` matching it.
+    picker: bool,
+    pick_scroll: usize,
+    apps: Option<Vec<(String, String)>>,
+    pick_mix: bool,
+    pick_q: String,
+    pick_hits: Vec<usize>,
+    /// Note being edited on the Notes tab.
+    edit: Option<usize>,
+    /// Quick-launch and shelf paths (own file, so a settings save never clobbers them).
+    items: Items,
     own_seq: u32,
     worker: Option<media::Worker>,
     last_tick: Instant,
@@ -392,6 +701,7 @@ impl Island {
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let hwnd = create_window()?;
             let _ = AddClipboardFormatListener(hwnd);
+            DragAcceptFiles(hwnd, true); // Shelf / Launch drop-in
             if let Err(e) = windows::Win32::System::Ole::OleInitialize(None) {
                 crate::warn!("island: OleInitialize failed ({e}); drag-out may not work");
             } // needed by DoDragDrop
@@ -446,8 +756,26 @@ impl Island {
                 seek: None,
                 press: None,
                 scroll: 0,
+                filter: 0,
                 flash: None,
+                hud: None,
                 store: clip::Store::load(cfg.history_days),
+                sys_prev: (0, 0),
+                sys: None,
+                sys_t: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
+                mix: Vec::new(),
+                master: (0.0, false),
+                bri: Vec::new(),
+                mix_t: now.checked_sub(Duration::from_secs(5)).unwrap_or(now),
+                slide: None,
+                picker: false,
+                pick_scroll: 0,
+                apps: None,
+                pick_mix: false,
+                pick_q: String::new(),
+                pick_hits: Vec::new(),
+                edit: None,
+                items: Items::load(),
                 own_seq: 0,
                 worker: Some(worker),
                 last_tick: now,
@@ -465,6 +793,12 @@ impl Island {
         self.side = parse_side(&cfg.side);
         self.rgb = parse_rgb(&cfg.bg);
         self.store.set_days(cfg.history_days);
+        if !self.tabs().iter().any(|t| t.2 == self.tab) {
+            self.tab = Tab::Clip;
+        }
+        if !cfg.clip_tools || (self.filter == 3 && !cfg.clip_images) {
+            self.filter = 0;
+        }
         if self.shown {
             unsafe { self.place() };
             self.touch();
@@ -476,6 +810,13 @@ impl Island {
     /// Content box (w, h): wide on the top edge, tall on the sides. Same for both tabs.
     fn cb(&self) -> (f32, f32) {
         let (np, t) = if self.tab == Tab::Media { (self.players.max(1), self.tiles as f32) } else { (1, 0.0) };
+        if self.tab == Tab::Sound {
+            // Grow sideways so every app column (+ the "+" column) and every brightness pill fits.
+            let n = self.bri.len().max(1) as f32;
+            let need = self.col_x(self.mix.len() + 1) + COL_W + 14.0 + n * BRI_W + (n - 1.0) * BRI_GAP + PAD;
+            let base = if self.side == Side::Top { (TOP_MIN_W, TOP_BOX.1) } else { SIDE_BOX };
+            return (base.0.max(need).min(1600.0), base.1);
+        }
         if self.side == Side::Top {
             let w = if self.tab == Tab::Media { self.player_w() * np as f32 + t * (TILE_W + TILE_GAP) } else { TOP_MIN_W };
             (w, TOP_BOX.1)
@@ -485,6 +826,70 @@ impl Island {
             (SIDE_BOX.0, SIDE_BOX.1.max(MULTI_Y + np as f32 * MULTI_H + 20.0))
         } else {
             SIDE_BOX
+        }
+    }
+
+    /// Sound tab: (track height, app columns that fit incl. master, x of the first brightness pill).
+    /// One column after the apps is kept for the "+" pin button.
+    fn sound_lay(&self) -> (f32, usize, f32) {
+        let (bw, bh) = self.cb();
+        let th = (bh - SND_Y - MUTE_D - 40.0).clamp(90.0, 220.0);
+        let n = self.bri.len().max(1) as f32;
+        let bx = bw - PAD - n * BRI_W - (n - 1.0) * BRI_GAP;
+        let fit = ((bx - 14.0 - self.col_x(1) + COL_GAP) / (COL_W + COL_GAP)).max(1.0) as usize;
+        (th, 1 + (fit - 1).min(self.mix.len()), bx)
+    }
+
+    /// X of brightness pill i.
+    fn pill_x(bx: f32, i: usize) -> f32 {
+        bx + i as f32 * (BRI_W + BRI_GAP)
+    }
+
+    /// Left x of mixer column n (0 = master, then a divider, then apps).
+    fn col_x(&self, n: usize) -> f32 {
+        if n == 0 { PAD } else { PAD + COL_W + 16.0 + (n - 1) as f32 * (COL_W + COL_GAP) }
+    }
+
+    fn sample_mix(&mut self) {
+        self.mix_t = Instant::now();
+        sample_mix_async(self.hwnd, self.items.mix_pins.clone());
+    }
+
+    /// Level 0..1 from a y inside a track of height th starting at SND_Y.
+    fn level(y: f32, th: f32) -> f32 {
+        (1.0 - (y - SND_Y) / th).clamp(0.0, 1.0)
+    }
+
+    /// Drag/click on slider n (or usize::MAX - i for monitor i's brightness) at y.
+    fn slide_to(&mut self, n: usize, y: f32) {
+        let (th, ..) = self.sound_lay();
+        if n > usize::MAX - 64 {
+            let i = usize::MAX - n;
+            let v = Self::level(y, th + MUTE_D + 6.0);
+            if let Some(b) = self.bri.get_mut(i) {
+                *b = Some(v);
+                push_brightness(i, v);
+            }
+            return;
+        }
+        let v = Self::level(y, th);
+        if n == 0 {
+            self.master = (v, false);
+            mixer::set_master(Some(v), Some(false));
+        } else if let Some(ch) = self.mix.get_mut(n - 1) {
+            ch.vol = v;
+            ch.mute = false;
+            mixer::set_app(&ch.key, Some(v), Some(false));
+        }
+    }
+
+    fn toggle_mute(&mut self, n: usize) {
+        if n == 0 {
+            self.master.1 = !self.master.1;
+            mixer::set_master(None, Some(self.master.1));
+        } else if let Some(ch) = self.mix.get_mut(n - 1) {
+            ch.mute = !ch.mute;
+            mixer::set_app(&ch.key, None, Some(ch.mute));
         }
     }
 
@@ -572,9 +977,58 @@ impl Island {
         if self.side == Side::Top { (h, w / 2.0) } else { (w, h / 2.0) }
     }
 
-    /// Clipboard rows that fit under the tab bar.
+    /// Clipboard rows that fit under the tab bar and the filter strip.
     fn rows(&self) -> usize {
-        (((self.cb().1 - 72.0 + ROW_GAP) / ROW_PITCH) as usize).max(1)
+        (((self.cb().1 - LIST_Y - 16.0 + ROW_GAP) / ROW_PITCH) as usize).max(1)
+    }
+
+    /// Enabled tabs with their x and width; Clip and Media are always there.
+    fn tabs(&self) -> Vec<(f32, f32, Tab)> {
+        let c = &self.cfg;
+        let mut x = PAD;
+        let mut v = Vec::new();
+        for t in [Tab::Clip, Tab::Media, Tab::Sound, Tab::Launch, Tab::System, Tab::Shelf] {
+            let on = match t {
+                Tab::Sound => c.media_controls,
+                Tab::Launch => c.tab_launch,
+                Tab::System => c.tab_system,
+                Tab::Shelf => c.tab_shelf,
+                _ => true,
+            };
+            if on {
+                v.push((x, t.width(), t));
+                x += t.width() + TAB_GAP;
+            }
+        }
+        v
+    }
+
+    /// Store indexes shown by the current clipboard filter, newest first.
+    fn view(&self) -> Vec<usize> {
+        let f = if self.cfg.clip_tools { self.filter } else { 0 };
+        self.store
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| match f {
+                1 => !e.files,
+                2 => e.files && !e.img,
+                3 => e.img,
+                4 => e.pin,
+                _ => true,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Filter chips on the clipboard strip: (filter id, label, width).
+    fn chips(&self) -> Vec<(u8, &'static str, f32)> {
+        let mut v = vec![(0, "All", 40.0), (1, "Text", 46.0), (2, "Files", 48.0)];
+        if self.cfg.clip_images {
+            v.push((3, "Images", 60.0));
+        }
+        v.push((4, "Pinned", 60.0));
+        v
     }
 
     /// Layout of player `i`; players share the box equally, tiles get the extra space cb() adds.
@@ -861,11 +1315,35 @@ impl Island {
                 self.dirty = true;
             }
         }
+        if let Some((_, _, t)) = self.hud {
+            if t.elapsed() < Duration::from_millis(1400) {
+                flashing = true;
+            } else {
+                self.hud = None;
+                self.dirty = true;
+            }
+        }
         if self.mode == Mode::Open && now.duration_since(self.last_draw) >= Duration::from_millis(400) {
             if let Some(wk) = &self.worker {
                 if wk.state.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|x| x.playing) {
                     self.dirty = true;
                 }
+            }
+        }
+        if self.mode == Mode::Open && self.tab == Tab::System && now.duration_since(self.sys_t) >= Duration::from_secs(1) {
+            // Repaint only when a shown figure changes.
+            let key = |s: Option<Sys>| s.map(|s| ((s.cpu * 100.0) as u32, (s.ram * 100.0) as u32, s.bat, s.uptime_s / 60, s.disk_free >> 26));
+            let before = key(self.sys);
+            unsafe { self.sample_sys() };
+            if key(self.sys) != before {
+                self.dirty = true;
+            }
+        }
+        if self.mode == Mode::Open && self.tab == Tab::Sound && self.slide.is_none() && now.duration_since(self.mix_t) >= Duration::from_secs(1) {
+            let before = (self.mix.clone(), self.master);
+            self.sample_mix();
+            if (self.mix.clone(), self.master) != before {
+                self.dirty = true;
             }
         }
         if self.mode == Mode::Hidden && !moving && self.v <= 0.0 && self.shown {
@@ -889,7 +1367,7 @@ impl Island {
             self.dirty = false;
             self.last_draw = now;
         }
-        self.timer(if moving || self.dirty || flashing || self.animating || self.row_anim { 16 } else if self.mode == Mode::Hidden { 10 } else { 33 });
+        self.timer(if moving || self.dirty || flashing || self.animating || self.row_anim { 16 } else if self.mode == Mode::Hidden { 25 } else { 33 }); // hidden: 40 Hz edge poll is plenty, 100 Hz burned idle CPU
     }
 
     unsafe fn pointer(&mut self, now: Instant) {
@@ -1090,7 +1568,7 @@ impl Island {
     }
 
     /// Shell icon for a path as a bitmap, cached. None when the shell has no icon.
-    unsafe fn icon(&mut self, rt: &ID2D1DCRenderTarget, path: &str) -> Option<ID2D1Bitmap> {
+    unsafe fn icon(&mut self, rt: &ID2D1DCRenderTarget, path: &str, img: bool) -> Option<ID2D1Bitmap> {
         if let Some(b) = self.icons.get(path) {
             return b.clone();
         }
@@ -1100,7 +1578,7 @@ impl Island {
         if self.wic.is_none() {
             self.wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok();
         }
-        let bmp = self.wic.as_ref().and_then(|wic| shell_icon(rt, wic, path));
+        let bmp = self.wic.as_ref().and_then(|wic| if img { thumb(rt, wic, path) } else { shell_icon(rt, wic, path) });
         self.icons.insert(path.to_string(), bmp.clone());
         bmp
     }
@@ -1133,8 +1611,8 @@ impl Island {
         let (bw, _) = self.cb();
 
         // Tab bar.
-        for (x, w, tab) in TABS {
-            let label = if tab == Tab::Clip { "Clipboard" } else { "Media" };
+        for (x, w, tab) in self.tabs() {
+            let label = tab.label();
             let on = self.tab == tab;
             if on {
                 c.rrect(x, 14.0, w, 28.0, TAB_R, 0.16);
@@ -1157,38 +1635,57 @@ impl Island {
 
         if self.tab == Tab::Clip {
             let cw = bw - 2.0 * PAD;
-            if self.hover == Hover::Clear {
-                c.rrect(bw - PAD - 66.0, 16.0, 66.0, 24.0, 6.0, 0.1);
+            // Filter strip: chips on the left, Clear on the right.
+            if self.cfg.clip_tools {
+                let mut x = PAD;
+                for (id, label, w) in self.chips() {
+                    let on = self.filter == id;
+                    if on {
+                        c.rrect(x, CHIP_Y, w, CHIP_H, 8.0, 0.16);
+                    } else if self.hover == Hover::Chip(id) {
+                        c.rrect(x, CHIP_Y, w, CHIP_H, 8.0, 0.08);
+                    }
+                    c.text(label, &fo.center, x, CHIP_Y, w, CHIP_H, if on { 1.0 } else { 0.55 });
+                    x += w + 4.0;
+                }
             }
-            c.text("Clear", &fo.center, bw - PAD - 66.0, 16.0, 66.0, 24.0, 0.6);
+            if self.hover == Hover::Clear {
+                c.rrect(bw - PAD - 46.0, CHIP_Y, 46.0, CHIP_H, 8.0, 0.1);
+            }
+            c.text("Clear", &fo.small, bw - PAD - 46.0, CHIP_Y, 46.0, CHIP_H, 0.6);
+            let view = self.view();
             let sf = self.scroll_f.max(0.0);
             let first = sf.floor() as usize;
             let frac = sf - first as f32;
             let icons: Vec<Option<ID2D1Bitmap>> = (0..self.rows() + 1)
                 .map(|i| {
-                    let e = self.store.items.get(first + i)?;
+                    let e = self.store.items.get(*view.get(first + i)?)?;
                     if !e.files {
                         return None;
                     }
                     let path = e.s.lines().next()?.to_string();
-                    self.icon(rt, &path)
+                    self.icon(rt, &path, e.img)
                 })
                 .collect();
             let items = &self.store.items;
-            if items.is_empty() {
-                c.text("\u{E8C8}", &fo.icon_big, PAD, 90.0, cw, 36.0, 0.3);
-                c.text("Nothing copied yet", &fo.center, PAD, 130.0, cw, 24.0, 0.7);
-                c.text("Copy text or files and they show up here", &fo.center, PAD, 156.0, cw, 18.0, 0.4);
-            } else {
-                c.text(&format!("{} items", items.len()), &fo.small, PAD + 190.0, 14.0, 90.0, 28.0, 0.4);
+            if view.is_empty() {
+                let (g, t, s) = match (items.is_empty(), self.filter) {
+                    (true, _) => ("\u{E8C8}", "Nothing copied yet", "Copy text or files and they show up here"),
+                    (_, 4) => ("\u{E718}", "Nothing pinned", "Hover an item and tap the pin"),
+                    _ => ("\u{E71C}", "Nothing here", "No items match this filter"),
+                };
+                c.text(g, &fo.icon_big, PAD, 100.0, cw, 36.0, 0.3);
+                c.text(t, &fo.center, PAD, 140.0, cw, 24.0, 0.7);
+                c.text(s, &fo.center, PAD, 166.0, cw, 18.0, 0.4);
             }
             let lh = ROW_PITCH * self.rows() as f32;
-            rt.PushAxisAlignedClip(&rect(ox, oy + 52.0, bw, lh + 4.0), D2D1_ANTIALIAS_MODE_ALIASED);
+            rt.PushAxisAlignedClip(&rect(ox, oy + LIST_Y - 4.0, bw, lh + 4.0), D2D1_ANTIALIAS_MODE_ALIASED);
             for i in 0..self.rows() + 1 {
-                let idx = first + i;
+                let Some(&idx) = view.get(first + i) else { break };
                 let Some(e) = items.get(idx) else { break };
-                let y = 56.0 + ROW_PITCH * (i as f32 - frac);
-                let hot = self.hover == Hover::Row(idx);
+                let y = LIST_Y + ROW_PITCH * (i as f32 - frac);
+                let hot = matches!(self.hover, Hover::Row(h) | Hover::Pin(h) | Hover::Del(h) if h == idx);
+                let tools = self.cfg.clip_tools;
                 let flashing = matches!(self.flash, Some((fi, _)) if fi == idx);
                 let lifted = idx == self.row_i && alpha >= 1.0 && (self.row_t > 0.0 || self.press_t > 0.0);
                 if lifted {
@@ -1204,6 +1701,14 @@ impl Island {
                 let glyph = if flashing { "\u{E73E}" } else if e.files { "\u{E8A5}" } else { "\u{E8C8}" };
                 c.rrect(PAD + 10.0, y + 6.0, 30.0, 30.0, 12.0, if flashing { 0.22 } else { 0.09 });
                 match (&icons[i], flashing) {
+                    (Some(bmp), false) if e.img => {
+                        // Thumbnail: fit inside the 30px tile, keep aspect.
+                        let s = bmp.GetSize();
+                        let k = 26.0 / s.width.max(s.height);
+                        let (tw, th) = (s.width * k, s.height * k);
+                        let d = rect(ox + PAD + 25.0 - tw / 2.0, oy + y + 21.0 - th / 2.0, tw, th);
+                        rt.DrawBitmap(bmp, Some(&d), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                    }
                     (Some(bmp), false) => {
                         let d = rect(ox + PAD + 13.0, oy + y + 9.0, 24.0, 24.0);
                         rt.DrawBitmap(bmp, Some(&d), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
@@ -1214,12 +1719,24 @@ impl Island {
                 let lw = if sz.is_empty() { cw - 50.0 - 52.0 } else { cw - 50.0 - 52.0 - 64.0 };
                 c.text(&row_label(e), &fo.body, PAD + 50.0, y, lw, ROW_H, 1.0);
                 if !sz.is_empty() {
-                    let x = if hot && !flashing { cw - 98.0 - 64.0 } else { cw - 48.0 - 64.0 };
+                    let x = if hot && !flashing { cw - 98.0 - 64.0 - if tools { 6.0 } else { 0.0 } } else { cw - 48.0 - 64.0 };
                     c.text(&sz, &fo.small_r, PAD + x, y, 60.0, ROW_H, 0.45);
                 }
-                if hot && !flashing {
+                if hot && !flashing && tools {
+                    // Pin and delete buttons replace the age on hover.
+                    for (bx, glyph, h, a) in [(PIN_X, if e.pin { "\u{E77A}" } else { "\u{E718}" }, Hover::Pin(idx), if e.pin { 1.0 } else { 0.7 }), (DEL_X, "\u{E74D}", Hover::Del(idx), 0.7)] {
+                        let bx = cw - bx;
+                        if self.hover == h {
+                            c.rrect(PAD + bx, y + 9.0, 24.0, 24.0, 8.0, 0.16);
+                        }
+                        c.text(glyph, &fo.icon, PAD + bx, y + 9.0, 24.0, 24.0, if self.hover == h { 1.0 } else { a });
+                    }
+                } else if hot && !flashing {
                     c.text("Click to copy", &fo.small_r, PAD + cw - 98.0, y, 90.0, ROW_H, 0.55);
                 } else {
+                    if e.pin {
+                        c.text("\u{E718}", &fo.icon, PAD + cw - 66.0, y, 18.0, ROW_H, 0.8);
+                    }
                     c.text(&age(e.t), &fo.small_r, PAD + cw - 48.0, y, 40.0, ROW_H, 0.45);
                 }
                 if lifted {
@@ -1230,6 +1747,224 @@ impl Island {
             return Ok(());
         }
 
+        if self.tab == Tab::Sound {
+            let (th, cols, bx) = self.sound_lay();
+            let mix = std::mem::take(&mut self.mix);
+            // Vertical track: rounded capsule, fill grows up from a circular base holding the glyph.
+            let track = |x: f32, w: f32, h: f32, v: f32, mute: bool, hot: bool| {
+                c.rrect(x, SND_Y, w, h, w / 2.0, if hot { 0.18 } else { 0.12 });
+                let fh = w + (h - w) * v;
+                c.rrect(x, SND_Y + h - fh, w, fh, w / 2.0, if mute { 0.35 } else { 0.92 });
+            };
+            for n in 0..cols.min(mix.len() + 1) {
+                let cx = self.col_x(n);
+                let (v, mute, name) = if n == 0 { (self.master.0, self.master.1, "Master") } else { (mix[n - 1].vol, mix[n - 1].mute, mix[n - 1].name.as_str()) };
+                let tx = cx + (COL_W - 36.0) / 2.0;
+                track(tx, 36.0, th, v, mute, self.hover == Hover::Vol(n) || self.slide == Some(n));
+                let gy = SND_Y + th - 36.0;
+                if n == 0 {
+                    c.ink(if mute { "\u{E74F}" } else { "\u{E767}" }, &fo.icon, tx, gy + 9.0, 36.0, 20.0, 0.85);
+                } else {
+                    match self.icon(rt, &mix[n - 1].path, false) {
+                        Some(bmp) => rt.DrawBitmap(&bmp, Some(&rect(ox + tx + 8.0, oy + gy + 8.0, 20.0, 20.0)), alpha * if mute { 0.5 } else { 1.0 }, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                        None => c.ink("\u{E8D6}", &fo.icon, tx, gy + 9.0, 36.0, 20.0, 0.85),
+                    }
+                }
+                // Mute button under the track.
+                let my = SND_Y + th + 6.0;
+                let hot = self.hover == Hover::Mute(n);
+                c.rrect(cx + (COL_W - MUTE_D) / 2.0, my, MUTE_D, MUTE_D, MUTE_D / 2.0, if mute { 0.22 } else if hot { 0.14 } else { 0.06 });
+                c.text(if mute { "\u{E74F}" } else { "\u{E767}" }, &fo.icon, cx, my + 5.0, COL_W, 18.0, if mute || hot { 1.0 } else { 0.6 });
+                c.text(name, &fo.center, cx - 2.0, my + MUTE_D + 3.0, COL_W + 4.0, 16.0, 0.6);
+                if n == 0 {
+                    c.rrect(cx + COL_W + 7.0, SND_Y + 8.0, 1.0, th + MUTE_D - 10.0, 0.5, 0.12);
+                }
+            }
+            self.mix = mix;
+            // "+" column: pin another app so it always shows.
+            let ax = self.col_x(cols) + (COL_W - 36.0) / 2.0;
+            let hot = self.hover == Hover::Add;
+            c.rrect(ax, SND_Y, 36.0, th, 18.0, if hot { 0.12 } else { 0.05 });
+            c.text("\u{E710}", &fo.icon, ax, SND_Y + th / 2.0 - 10.0, 36.0, 20.0, if hot { 1.0 } else { 0.5 });
+            c.text("Add", &fo.center, ax - 10.0, SND_Y + th + 6.0 + MUTE_D + 3.0, 56.0, 16.0, if hot { 0.9 } else { 0.5 });
+            // Brightness: one iOS-style pill per monitor, left to right.
+            let ph = th + MUTE_D + 6.0;
+            let n = self.bri.len().max(1);
+            for i in 0..n {
+                let x = Self::pill_x(bx, i);
+                let hot = self.hover == Hover::Bri(i) || self.slide == Some(usize::MAX - i);
+                let label = if n > 1 { format!("{}", i + 1) } else { String::new() };
+                match self.bri.get(i).copied().flatten() {
+                    Some(v) => {
+                        track(x, BRI_W, ph, v, false, hot);
+                        c.ink("\u{E706}", &fo.icon_big, x, SND_Y + ph - BRI_W / 2.0 - 14.0, BRI_W, 28.0, 0.85);
+                        let t = if n > 1 { format!("{label} \u{00B7} {:.0}%", v * 100.0) } else { format!("{:.0}%", v * 100.0) };
+                        c.text(&t, &fo.center, x - 6.0, SND_Y + ph + 3.0, BRI_W + 12.0, 16.0, 0.6);
+                    }
+                    None => {
+                        c.rrect(x, SND_Y, BRI_W, ph, BRI_W / 2.0, 0.06);
+                        c.text("\u{E706}", &fo.icon_big, x, SND_Y + ph - BRI_W / 2.0 - 14.0, BRI_W, 28.0, 0.3);
+                        let t = if self.bri.is_empty() { "...".to_string() } else if n > 1 { format!("{label} \u{00B7} N/A") } else { "N/A".into() };
+                        c.text(&t, &fo.center, x - 6.0, SND_Y + ph + 3.0, BRI_W + 12.0, 16.0, 0.4);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if self.tab == Tab::System {
+            if self.sys.is_none() {
+                self.sample_sys();
+            }
+            let Some(s) = self.sys else { return Ok(()) };
+            let cw = bw - 2.0 * PAD;
+            let up = s.uptime_s;
+            let up = if up >= 86400 { format!("{}d {}h", up / 86400, up / 3600 % 24) } else { format!("{}h {}m", up / 3600, up / 60 % 60) };
+            let disk = 1.0 - s.disk_free as f32 / s.disk_total.max(1) as f32;
+            // (fraction, label, detail, warn)
+            let mut g: Vec<(f32, &str, String, bool)> = vec![
+                (s.cpu, "CPU", "Usage".into(), s.cpu > 0.9),
+                (s.ram, "Memory", format!("{} / {}", gb(s.ram_used), gb(s.ram_total)), s.ram > 0.9),
+                (disk, "Disk C:", format!("{} free", gb(s.disk_free)), disk > 0.9),
+            ];
+            if let Some((p, chg)) = s.bat {
+                let f = p as f32 / 100.0;
+                g.push((f, "Battery", if chg { "Charging".into() } else { "On battery".into() }, f < 0.2 && !chg));
+            }
+            let slot = cw / g.len() as f32;
+            let r = (slot / 2.0 - 12.0).min(32.0);
+            let cy = 68.0 + r;
+            for (i, (f, label, detail, warn)) in g.iter().enumerate() {
+                let x = PAD + slot * i as f32;
+                let cx = x + slot / 2.0;
+                c.ring(cx, cy, r, 6.0, *f, 0.9, *warn);
+                c.text(&format!("{:.0}%", f * 100.0), &fo.num, x, cy - 12.0, slot, 24.0, 0.95);
+                c.text(label, &fo.center, x, cy + r + 8.0, slot, 18.0, 0.85);
+                c.text(detail, &fo.center, x + 2.0, cy + r + 26.0, slot - 4.0, 16.0, 0.45);
+            }
+            let y = cy + r + 52.0;
+            c.rrect(PAD, y, cw, 34.0, 12.0, 0.06);
+            c.text("\u{E823}", &fo.icon, PAD + 8.0, y, 24.0, 34.0, 0.75);
+            c.text("Uptime", &fo.body, PAD + 38.0, y, cw - 170.0, 34.0, 0.9);
+            c.text(&up, &fo.small_r, PAD + cw - 140.0, y, 130.0, 34.0, 0.6);
+            return Ok(());
+        }
+
+        if self.picking() {
+            let cw = bw - 2.0 * PAD;
+            let hot = self.hover == Hover::Back;
+            c.rrect(PAD, 56.0, 32.0, 32.0, 10.0, if hot { 0.14 } else { 0.06 });
+            c.text("\u{E72B}", &fo.icon, PAD, 56.0, 32.0, 32.0, if hot { 1.0 } else { 0.7 });
+            c.text(if self.pick_mix { "Pin an app" } else { "Add an app" }, &fo.title, PAD + 44.0, 56.0, 150.0, 32.0, 0.95);
+            // Search box: typing goes here while the picker is open.
+            let (sx, sw) = (PAD + 200.0, cw - 200.0);
+            c.rrect(sx, 58.0, sw, 28.0, 14.0, 0.08);
+            c.text("\u{E721}", &fo.icon, sx + 6.0, 58.0, 22.0, 28.0, 0.5);
+            if self.pick_q.is_empty() {
+                c.text("Search", &fo.body, sx + 32.0, 58.0, sw - 40.0, 28.0, 0.4);
+            } else {
+                c.text(&format!("{}|", self.pick_q), &fo.body, sx + 32.0, 58.0, sw - 40.0, 28.0, 0.95);
+            }
+            if self.apps.is_none() {
+                c.text(if self.pick_mix { "Finding audio apps..." } else { "Finding apps..." }, &fo.center, PAD, PICK_Y + 20.0, cw, 20.0, 0.6);
+                return Ok(());
+            }
+            if self.pick_hits.is_empty() {
+                c.text("No matches", &fo.center, PAD, PICK_Y + 20.0, cw, 20.0, 0.6);
+            }
+            let rows = self.pick_rows();
+            let total = self.pick_hits.len();
+            for k in self.pick_scroll..total.min(self.pick_scroll + rows) {
+                // Only the visible rows are cloned (icon() needs &mut self).
+                let Some((name, path)) = self.apps.as_ref().and_then(|a| a.get(self.pick_hits[k])).cloned() else { continue };
+                let (name, path) = (&name, &path);
+                let y = PICK_Y + (k - self.pick_scroll) as f32 * PICK_H;
+                let hot = self.hover == Hover::App(k);
+                if hot {
+                    c.rrect(PAD, y, cw, PICK_H - 4.0, 10.0, 0.12);
+                }
+                let bmp = if self.pick_mix { None } else { self.icon(rt, path, false) };
+                match bmp {
+                    Some(bmp) => rt.DrawBitmap(&bmp, Some(&rect(ox + PAD + 8.0, oy + y + 6.0, 24.0, 24.0)), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                    None => c.text(if self.pick_mix { "\u{E767}" } else { "\u{E8A5}" }, &fo.icon, PAD + 8.0, y, 24.0, PICK_H - 4.0, 0.6),
+                }
+                c.text(name, &fo.body, PAD + 42.0, y, cw - 50.0, PICK_H - 4.0, if hot { 1.0 } else { 0.85 });
+            }
+            // Thin scroll indicator when the list overflows.
+            if total > rows {
+                let track = rows as f32 * PICK_H - 4.0;
+                let th = (track * rows as f32 / total as f32).max(16.0);
+                let ty = PICK_Y + (track - th) * self.pick_scroll as f32 / (total - rows) as f32;
+                c.rrect(bw - PAD + 8.0, ty, 3.0, th, 1.5, 0.3);
+            }
+            return Ok(());
+        }
+
+        if self.tab == Tab::Shelf {
+            // Sticky notes: "+" card first, then one card per note.
+            let n = self.items.notes.len().min(self.note_cap());
+            let (ax, ay, nw, nh) = self.note_rect(0);
+            let hot = self.hover == Hover::Add;
+            c.rrect(ax, ay, nw, nh, 14.0, if hot { 0.14 } else { 0.06 });
+            c.text("\u{E710}", &fo.icon_big, ax, ay + nh / 2.0 - 26.0, nw, 36.0, if hot { 1.0 } else { 0.6 });
+            c.text("New note", &fo.center, ax, ay + nh / 2.0 + 10.0, nw, 18.0, if hot { 1.0 } else { 0.7 });
+            for i in 0..n {
+                let (x, y, w, h) = self.note_rect(i + 1);
+                let hot = self.hover == Hover::Item(i);
+                let editing = self.edit == Some(i);
+                c.rrect(x, y, w, h, 14.0, if editing { 0.18 } else if hot { 0.13 } else { 0.08 });
+                let t = &self.items.notes[i];
+                if t.is_empty() && !editing {
+                    c.text("Empty note", &fo.small, x + 12.0, y + 10.0, w - 24.0, h - 20.0, 0.4);
+                } else {
+                    let s = if editing { format!("{t}|") } else { t.clone() };
+                    c.text(&s, &fo.small, x + 12.0, y + 10.0, w - 24.0, h - 20.0, 0.9);
+                }
+            }
+            if n == 0 {
+                let cw = bw - 2.0 * PAD;
+                c.text("Click a note to type, right-click to delete", &fo.center, PAD, ay + nh + 12.0, cw, 18.0, 0.4);
+            }
+            return Ok(());
+        }
+
+        if self.tab == Tab::Launch {
+            let cw = bw - 2.0 * PAD;
+            let n = self.shown();
+            // "+" tile: opens a file picker.
+            let (ax, ay) = self.tile_xy(n);
+            let hot = self.hover == Hover::Add;
+            c.rrect(ax, ay, TILE, TILE, 14.0, if hot { 0.14 } else { 0.06 });
+            c.text("\u{E710}", &fo.icon_big, ax, ay + 8.0, TILE, 36.0, if hot { 1.0 } else { 0.6 });
+            c.text("Add", &fo.center, ax + 4.0, ay + 48.0, TILE - 8.0, 18.0, if hot { 1.0 } else { 0.7 });
+            if self.items.launch.is_empty() {
+                c.text("Click + or drop apps here", &fo.center, PAD, ay + TILE + 16.0, cw, 20.0, 0.7);
+                c.text("Right-click a tile to remove it", &fo.center, PAD, ay + TILE + 38.0, cw, 18.0, 0.4);
+            }
+            for i in 0..n {
+                let p = &self.items.launch[i].clone();
+                let (x, y) = self.tile_xy(i);
+                let hot = self.hover == Hover::Item(i);
+                c.rrect(x, y, TILE, TILE, 14.0, if hot { 0.14 } else { 0.06 });
+                match self.icon(rt, p, false) {
+                    Some(bmp) => rt.DrawBitmap(&bmp, Some(&rect(ox + x + 20.0, oy + y + 10.0, 32.0, 32.0)), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                    None => c.text("\u{E8A5}", &fo.icon_big, x, y + 8.0, TILE, 36.0, 0.6),
+                }
+                c.text(file_name(p), &fo.center, x + 4.0, y + 48.0, TILE - 8.0, 18.0, if hot { 1.0 } else { 0.7 });
+            }
+            return Ok(());
+        }
+
+        if let Some((bright, v, t)) = self.hud {
+            let a = (1.4 - t.elapsed().as_secs_f32()).clamp(0.0, 0.3) / 0.3;
+            let (hx, hy) = (bw - PAD - 150.0, 14.0);
+            let cc = Ctx { rt, br, fg, alpha: alpha * a, ox, oy };
+            cc.rrect(hx, hy, 150.0, 28.0, 14.0, 0.14);
+            cc.text(if bright { "\u{E706}" } else if v <= 0.0 { "\u{E74F}" } else { "\u{E767}" }, &fo.icon, hx + 4.0, hy, 24.0, 28.0, 0.9);
+            cc.rrect(hx + 32.0, hy + 12.0, 80.0, 4.0, 2.0, 0.2);
+            cc.rrect(hx + 32.0, hy + 12.0, 80.0 * v, 4.0, 2.0, 0.95);
+            cc.text(&format!("{}%", (v * 100.0).round()), &fo.small_r, hx + 116.0, hy + 6.0, 30.0, 16.0, 0.7);
+        }
         // Media tab: every playing session gets an equal player, the rest are small tiles.
         if sessions.is_empty() {
             self.anim.clear();
@@ -1397,20 +2132,104 @@ impl Island {
     fn hit(&self, x: f32, y: f32) -> Hover {
         let (bw, _) = self.cb();
         if (14.0..42.0).contains(&y) {
-            for (tx, tw, tab) in TABS {
+            for (tx, tw, tab) in self.tabs() {
                 if (tx..tx + tw).contains(&x) {
                     return Hover::Tab(tab);
                 }
             }
         }
-        if self.tab == Tab::Clip {
-            if (bw - 90.0..bw - PAD).contains(&x) && (16.0..40.0).contains(&y) {
-                return Hover::Clear;
+        if self.tab == Tab::System {
+            return Hover::None;
+        }
+        if self.tab == Tab::Sound {
+            let (th, cols, bx) = self.sound_lay();
+            for i in 0..self.bri.len() {
+                let px = Self::pill_x(bx, i);
+                if (px..px + BRI_W).contains(&x) && (SND_Y..SND_Y + th + MUTE_D + 8.0).contains(&y) {
+                    return Hover::Bri(i);
+                }
             }
-            if (PAD..bw - PAD).contains(&x) && y >= 56.0 {
-                let i = ((y - 56.0) / ROW_PITCH) as usize;
-                if i < self.rows() && (y - 56.0) - ROW_PITCH * i as f32 <= ROW_H && self.scroll + i < self.store.items.len() {
-                    return Hover::Row(self.scroll + i);
+            let ax = self.col_x(cols);
+            if (ax..ax + COL_W).contains(&x) && (SND_Y..SND_Y + th + MUTE_D + 24.0).contains(&y) {
+                return Hover::Add;
+            }
+            for n in 0..cols.min(self.mix.len() + 1) {
+                let cx = self.col_x(n);
+                if !(cx..cx + COL_W).contains(&x) {
+                    continue;
+                }
+                if (SND_Y..SND_Y + th).contains(&y) {
+                    return Hover::Vol(n);
+                }
+                if (SND_Y + th + 6.0..SND_Y + th + 6.0 + MUTE_D).contains(&y) {
+                    return Hover::Mute(n);
+                }
+            }
+            return Hover::None;
+        }
+        if self.picking() {
+            if (PAD..PAD + 32.0).contains(&x) && (56.0..88.0).contains(&y) {
+                return Hover::Back;
+            }
+            if (PAD..bw - PAD).contains(&x) && y >= PICK_Y {
+                let k = ((y - PICK_Y) / PICK_H) as usize;
+                if k < self.pick_rows() && self.pick_scroll + k < self.pick_hits.len() {
+                    return Hover::App(self.pick_scroll + k);
+                }
+            }
+            return Hover::None;
+        }
+        if self.tab == Tab::Shelf {
+            let n = self.items.notes.len().min(self.note_cap());
+            for i in 0..=n {
+                let (nx, ny, nw, nh) = self.note_rect(i);
+                if (nx..nx + nw).contains(&x) && (ny..ny + nh).contains(&y) {
+                    return if i == 0 { Hover::Add } else { Hover::Item(i - 1) };
+                }
+            }
+            return Hover::None;
+        }
+        if self.tab == Tab::Launch {
+            let n = self.shown();
+            for i in 0..=n {
+                let (tx, ty) = self.tile_xy(i);
+                if (tx..tx + TILE).contains(&x) && (ty..ty + TILE).contains(&y) {
+                    return if i == n { Hover::Add } else { Hover::Item(i) };
+                }
+            }
+            return Hover::None;
+        }
+        if self.tab == Tab::Clip {
+            if (CHIP_Y..CHIP_Y + CHIP_H).contains(&y) {
+                if (bw - PAD - 46.0..bw - PAD).contains(&x) {
+                    return Hover::Clear;
+                }
+                if self.cfg.clip_tools {
+                    let mut cx = PAD;
+                    for (id, _, w) in self.chips() {
+                        if (cx..cx + w).contains(&x) {
+                            return Hover::Chip(id);
+                        }
+                        cx += w + 4.0;
+                    }
+                }
+            }
+            if (PAD..bw - PAD).contains(&x) && y >= LIST_Y {
+                let i = ((y - LIST_Y) / ROW_PITCH) as usize;
+                let view = self.view();
+                if i < self.rows() && (y - LIST_Y) - ROW_PITCH * i as f32 <= ROW_H {
+                    if let Some(&idx) = view.get(self.scroll + i) {
+                        if self.cfg.clip_tools {
+                            let rx = bw - PAD - x; // distance from the row's right edge
+                            if (PIN_X - 24.0..PIN_X).contains(&rx) && self.hover_row(idx) {
+                                return Hover::Pin(idx);
+                            }
+                            if (DEL_X - 24.0..DEL_X).contains(&rx) && self.hover_row(idx) {
+                                return Hover::Del(idx);
+                            }
+                        }
+                        return Hover::Row(idx);
+                    }
                 }
             }
             return Hover::None;
@@ -1439,6 +2258,150 @@ impl Island {
         Hover::None
     }
 
+    /// Buttons only exist on the hovered row, so they are hit-tested only once it is hot.
+    fn list(&self) -> &Vec<String> {
+        &self.items.launch
+    }
+
+    /// App picker is up (Launch "+" or Sound "+").
+    fn picking(&self) -> bool {
+        self.picker && ((self.tab == Tab::Launch && !self.pick_mix) || (self.tab == Tab::Sound && self.pick_mix))
+    }
+
+    /// Rebuilds the visible picker rows from the search text (case-insensitive substring).
+    fn filter_picker(&mut self) {
+        let q = self.pick_q.to_lowercase();
+        self.pick_hits = match self.apps.as_ref() {
+            Some(a) => a.iter().enumerate().filter(|(_, (n, _))| q.is_empty() || n.to_lowercase().contains(&q)).map(|(i, _)| i).collect(),
+            None => Vec::new(),
+        };
+        self.pick_scroll = 0;
+    }
+
+    /// Sticky-note card slot `i` (0 = "+" card): 3 columns, wraps by row.
+    fn note_rect(&self, i: usize) -> (f32, f32, f32, f32) {
+        let (bw, _) = self.cb();
+        let (cols, gap, h) = (3usize, 10.0, 96.0);
+        let w = (bw - 2.0 * PAD - gap * (cols - 1) as f32) / cols as f32;
+        (PAD + (i % cols) as f32 * (w + gap), 60.0 + (i / cols) as f32 * (h + gap), w, h)
+    }
+
+    /// Notes that fit in the box (after the "+" card).
+    fn note_cap(&self) -> usize {
+        let (_, bh) = self.cb();
+        (((bh - 60.0) / 106.0) as usize).max(1) * 3 - 1
+    }
+
+    /// Columns and rows of the Shelf/Launch grid for the current box.
+    fn grid(&self) -> (usize, usize) {
+        let (bw, bh) = self.cb();
+        ((((bw - 2.0 * PAD + 8.0) / TILE_P) as usize).max(1), (((bh - 68.0) / TILE_P) as usize).max(1))
+    }
+
+    /// Items drawn in the grid; the slot after them is the "+" tile.
+    fn shown(&self) -> usize {
+        let (cols, rows) = self.grid();
+        self.list().len().min(cols * rows - 1)
+    }
+
+    /// Native file picker on its own thread (a modal loop here would stall every Lumen module).
+    /// Results come back through PICKED + WM_PICKED.
+    fn pick_files(&self) {
+        if PICKING.swap(true, Ordering::AcqRel) {
+            return; // one dialog at a time
+        }
+        let hwnd = self.hwnd.0 as isize;
+        std::thread::spawn(move || unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let paths = pick_dialog(false, HWND(hwnd as *mut _));
+            CoUninitialize();
+            if !paths.is_empty() {
+                *PICKED.lock().unwrap_or_else(|e| e.into_inner()) = Some((false, paths));
+                let _ = PostMessageW(HWND(hwnd as *mut _), WM_PICKED, WPARAM(0), LPARAM(0));
+            }
+            PICKING.store(false, Ordering::Release);
+        });
+    }
+
+    /// Visible rows of the Launch app picker.
+    fn pick_rows(&self) -> usize {
+        let (_, bh) = self.cb();
+        (((bh - PICK_Y - 12.0) / PICK_H) as usize).max(1)
+    }
+
+    fn tile_xy(&self, i: usize) -> (f32, f32) {
+        let (bw, _) = self.cb();
+        let (cols, _) = self.grid();
+        let x0 = PAD + (bw - 2.0 * PAD - (cols as f32 * TILE_P - 8.0)) / 2.0;
+        (x0 + (i % cols) as f32 * TILE_P, 60.0 + (i / cols) as f32 * TILE_P)
+    }
+
+    fn item_remove(&mut self, i: usize) {
+        let v = if self.tab == Tab::Shelf { &mut self.items.notes } else { &mut self.items.launch };
+        if i < v.len() {
+            v.remove(i);
+            self.items.save();
+        }
+    }
+
+    unsafe fn sample_sys(&mut self) {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        use windows::Win32::System::SystemInformation::{GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        use windows::Win32::System::Threading::GetSystemTimes;
+        self.sys_t = Instant::now();
+        let ft = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+        let mut cpu = self.sys.map(|s| s.cpu).unwrap_or(0.0);
+        let (mut i, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+        if GetSystemTimes(Some(&mut i), Some(&mut k), Some(&mut u)).is_ok() {
+            // Kernel time includes idle time.
+            let (idle, total) = (ft(i), ft(k) + ft(u));
+            let (pi, pt) = self.sys_prev;
+            if pt > 0 && total > pt {
+                cpu = (1.0 - idle.saturating_sub(pi) as f32 / (total - pt) as f32).clamp(0.0, 1.0);
+            }
+            self.sys_prev = (idle, total);
+        }
+        let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        let _ = GlobalMemoryStatusEx(&mut m);
+        let mut p = SYSTEM_POWER_STATUS::default();
+        let bat = if GetSystemPowerStatus(&mut p).is_ok() && p.BatteryFlag & 128 == 0 && p.BatteryLifePercent <= 100 {
+            Some((p.BatteryLifePercent, p.ACLineStatus == 1))
+        } else {
+            None
+        };
+        let now_s = GetTickCount64() / 1000;
+        // Disk barely moves: hit the volume at most every 30 s.
+        let (mut free, mut total) = match self.sys {
+            Some(s) if now_s.saturating_sub(s.disk_at) < 30 => (s.disk_free, s.disk_total),
+            _ => (0, 0),
+        };
+        let disk_at = if total == 0 {
+            let _ = GetDiskFreeSpaceExW(w!("C:\\"), Some(&mut free), Some(&mut total), None);
+            now_s
+        } else {
+            self.sys.map(|s| s.disk_at).unwrap_or(now_s)
+        };
+        let used = m.ullTotalPhys.saturating_sub(m.ullAvailPhys);
+        self.sys = Some(Sys {
+            cpu,
+            ram: used as f32 / m.ullTotalPhys.max(1) as f32,
+            ram_used: used,
+            ram_total: m.ullTotalPhys,
+            bat,
+            disk_free: free,
+            disk_total: total,
+            disk_at,
+            uptime_s: now_s,
+        });
+    }
+
+    fn hover_row(&self, idx: usize) -> bool {
+        matches!(self.hover, Hover::Row(h) | Hover::Pin(h) | Hover::Del(h) if h == idx)
+    }
+
     fn scrub_frac(&self, i: usize, x: f32) -> f64 {
         let l = self.lay_n(i);
         (((x - l.tx) / l.tw).clamp(0.0, 1.0)) as f64
@@ -1461,9 +2424,15 @@ impl Island {
             std::thread::sleep(std::time::Duration::from_millis(40));
             got = clip::read(self.hwnd);
         }
-        if let Some((files, s)) = got {
-            crate::info!("island: clipboard captured (files={files}, {} chars)", s.len());
-            self.store.add(files, s);
+        let img = if got.is_none() && self.cfg.clip_images { clip::read_image(self.hwnd) } else { None };
+        if got.is_some() || img.is_some() {
+            if let Some((files, s)) = got {
+                crate::info!("island: clipboard captured (files={files}, {} chars)", s.len());
+                self.store.add(files, s);
+            } else if let Some(p) = img {
+                crate::info!("island: image captured");
+                self.store.add_image(p);
+            }
             self.store.save();
             if self.mode == Mode::Open {
                 self.scroll = 0;
@@ -1505,12 +2474,93 @@ impl Island {
                         self.touch();
                     }
                 }
+                WM_PICKED => {
+                    if let Some((_, paths)) = PICKED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        self.items.add(paths);
+                        self.touch();
+                    }
+                }
+                WM_APPS => {
+                    self.apps = APPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    self.filter_picker();
+                    self.touch();
+                }
+                WM_BRI => {
+                    let b = BRI_READ.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+                    let grow = b.len() != self.bri.len();
+                    self.bri = b;
+                    if grow && self.shown && self.tab == Tab::Sound {
+                        self.place();
+                    }
+                    self.touch();
+                }
+                WM_MIX => {
+                    if let Some((apps, master)) = MIX.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let master = master.unwrap_or(self.master);
+                        // Skip while dragging so the poll never fights the finger; repaint only on change.
+                        if self.slide.is_none() && (apps != self.mix || master != self.master) {
+                            let grow = apps.len() != self.mix.len();
+                            self.mix = apps;
+                            self.master = master;
+                            if grow && self.shown && self.tab == Tab::Sound {
+                                self.place(); // width follows the app count
+                            }
+                            self.touch();
+                        }
+                    }
+                }
+                WM_CHAR if self.mode == Mode::Open && (self.picking() || self.edit.is_some()) => {
+                    let Some(ch) = char::from_u32(wp.0 as u32) else { return Some(LRESULT(0)) };
+                    if self.picking() {
+                        match ch {
+                            '\u{8}' => { self.pick_q.pop(); }
+                            '\u{1b}' => self.picker = false,
+                            c if !c.is_control() => self.pick_q.push(c),
+                            _ => {}
+                        }
+                        self.filter_picker();
+                    } else if let Some(i) = self.edit {
+                        if let Some(t) = self.items.notes.get_mut(i) {
+                            match ch {
+                                '\u{8}' => { t.pop(); }
+                                '\u{1b}' => self.edit = None,
+                                '\r' => t.push('\n'),
+                                c if !c.is_control() => t.push(c),
+                                _ => {}
+                            }
+                        }
+                        self.items.save();
+                    }
+                    self.hover = Hover::None;
+                    self.touch();
+                    return Some(LRESULT(0));
+                }
                 WM_MOUSEACTIVATE => return Some(LRESULT(MA_NOACTIVATE as isize)),
+                WM_DROPFILES => {
+                    let h = HDROP(wp.0 as _);
+                    let n = DragQueryFileW(h, 0xFFFFFFFF, None);
+                    let mut paths = Vec::new();
+                    for i in 0..n {
+                        let mut buf = vec![0u16; DragQueryFileW(h, i, None) as usize + 1];
+                        let len = DragQueryFileW(h, i, Some(&mut buf)) as usize;
+                        paths.push(String::from_utf16_lossy(&buf[..len]));
+                    }
+                    DragFinish(h);
+                    if !paths.is_empty() && self.cfg.tab_launch {
+                        self.items.add(paths);
+                        self.touch();
+                    }
+                }
                 WM_MOUSEMOVE => {
                     let (x, y) = self.panel_pt(lp);
                     if self.drag.is_some() {
                         self.drag = Some(self.scrub_frac(self.drag_p, x));
                         self.touch();
+                    }
+                    if let Some(n) = self.slide {
+                        self.slide_to(n, y);
+                        self.touch();
+                        return Some(LRESULT(0));
                     }
                     if let Some((px, py, i)) = self.press {
                         let mut pt = POINT::default();
@@ -1520,7 +2570,15 @@ impl Island {
                             let _ = ReleaseCapture();
                             // Button already up (fast flick): the release is a click, not a drag.
                             let down = GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0;
-                            if let Some(e) = self.store.items.get(i).cloned() {
+                            if self.tab != Tab::Clip {
+                                if let Some(p) = self.list().get(i).cloned() {
+                                    if down {
+                                        clip::drag(&clip::Entry { t: 0, files: true, s: p, size: 0, pin: false, img: false });
+                                    } else {
+                                        open_path(&p);
+                                    }
+                                }
+                            } else if let Some(e) = self.store.items.get(i).cloned() {
                                 if down {
                                     clip::drag(&e);
                                 } else if clip::write(self.hwnd, &e) {
@@ -1554,12 +2612,20 @@ impl Island {
                         }
                         Hover::Tab(t) => {
                             if self.tab != t {
-                                self.tab_dir = if t == Tab::Media { 1.0 } else { -1.0 };
+                                let tabs = self.tabs();
+                                let pos = |x: Tab| tabs.iter().position(|q| q.2 == x).unwrap_or(0);
+                                self.tab_dir = if pos(t) > pos(self.tab) { 1.0 } else { -1.0 };
                                 self.tab_a = 0.0;
                             }
                             self.tab = t;
+                            self.picker = false;
+                            self.edit = None;
                             self.scroll_f = 0.0;
                             self.hover = Hover::None;
+                            if t == Tab::Sound {
+                                self.sample_mix();
+                                read_brightness(self.hwnd);
+                            }
                             if self.shown {
                                 self.place();
                             }
@@ -1588,19 +2654,96 @@ impl Island {
                             self.store.clear();
                             self.store.save();
                             self.flash = None;
+                            self.scroll = 0;
+                            self.scroll_f = 0.0;
                         }
-                        Hover::Row(i) => {
-                            // Copy happens on release (a click); moving first turns it into a drag-out.
+                        Hover::Chip(f) => {
+                            self.filter = f;
+                            self.scroll = 0;
+                            self.scroll_f = 0.0;
+                        }
+                        Hover::Pin(i) => {
+                            self.store.toggle_pin(i);
+                            self.store.save();
+                        }
+                        Hover::Del(i) => {
+                            self.store.remove(i);
+                            self.store.save();
+                            self.flash = None;
+                            self.hover = Hover::None;
+                            self.scroll = self.scroll.min(self.view().len().saturating_sub(self.rows()));
+                        }
+                        Hover::Item(i) if self.tab == Tab::Shelf => {
+                            self.edit = if self.edit == Some(i) { None } else { Some(i) };
+                            let _ = SetForegroundWindow(self.hwnd);
+                        }
+                        Hover::Row(i) | Hover::Item(i) => {
+                            // Copy/open happens on release (a click); moving first turns it into a drag-out.
                             let mut pt = POINT::default();
                             let _ = GetCursorPos(&mut pt);
                             self.press = Some((pt.x, pt.y, i));
                             SetCapture(self.hwnd);
                         }
+                        Hover::Add if self.tab == Tab::Launch || self.tab == Tab::Sound => {
+                            let mix = self.tab == Tab::Sound;
+                            // Both pickers share `apps`; rescan when switching kind (sessions change anyway).
+                            if mix || self.pick_mix || self.apps.is_none() {
+                                self.apps = None;
+                                if mix { scan_sessions(self.hwnd) } else { scan_apps(self.hwnd) }
+                            }
+                            self.picker = true;
+                            self.pick_mix = mix;
+                            self.pick_q.clear();
+                            self.filter_picker();
+                            self.hover = Hover::None;
+                            let _ = SetForegroundWindow(self.hwnd); // so typing reaches the search box
+                        }
+                        Hover::Add if self.tab == Tab::Shelf => {
+                            self.items.notes.push(String::new());
+                            self.edit = Some(self.items.notes.len() - 1);
+                            self.items.save();
+                            let _ = SetForegroundWindow(self.hwnd);
+                        }
+                        Hover::Add => self.pick_files(),
+                        Hover::Back => {
+                            self.picker = false;
+                            self.hover = Hover::None;
+                        }
+                        Hover::App(k) => {
+                            if let Some((_, p)) = self.pick_hits.get(k).and_then(|&a| self.apps.as_ref()?.get(a)).cloned() {
+                                if self.pick_mix {
+                                    if !self.items.mix_pins.iter().any(|q| q.eq_ignore_ascii_case(&p)) {
+                                        self.items.mix_pins.push(p);
+                                        self.items.save();
+                                    }
+                                    self.sample_mix();
+                                } else {
+                                    self.items.add(vec![p]);
+                                }
+                            }
+                            self.picker = false;
+                            self.hover = Hover::None;
+                        }
+                        Hover::Vol(n) => {
+                            self.slide = Some(n);
+                            SetCapture(self.hwnd);
+                            self.slide_to(n, y);
+                        }
+                        Hover::Bri(i) if matches!(self.bri.get(i), Some(Some(_))) => {
+                            self.slide = Some(usize::MAX - i);
+                            SetCapture(self.hwnd);
+                            self.slide_to(usize::MAX - i, y);
+                        }
+                        Hover::Mute(n) => self.toggle_mute(n),
                         _ => {}
                     }
                     self.touch();
                 }
                 WM_LBUTTONUP => {
+                    if self.slide.take().is_some() {
+                        let _ = ReleaseCapture();
+                        self.touch();
+                    }
                     if let Some(f) = self.drag.take() {
                         let _ = ReleaseCapture();
                         if let Some((id, d)) = self.seek.take() {
@@ -1610,7 +2753,11 @@ impl Island {
                     }
                     if let Some((_, _, i)) = self.press.take() {
                         let _ = ReleaseCapture();
-                        if let Some(e) = self.store.items.get(i).cloned() {
+                        if self.tab != Tab::Clip {
+                            if let Some(p) = self.list().get(i).cloned() {
+                                open_path(&p);
+                            }
+                        } else if let Some(e) = self.store.items.get(i).cloned() {
                             if clip::write(self.hwnd, &e) {
                                 self.own_seq = GetClipboardSequenceNumber();
                                 self.flash = Some((i, Instant::now()));
@@ -1621,18 +2768,37 @@ impl Island {
                     }
                 }
                 WM_CAPTURECHANGED => {
-                    if self.drag.take().is_some() || self.press.take().is_some() {
+                    if self.drag.take().is_some() | self.press.take().is_some() | self.slide.take().is_some() {
                         self.touch();
                     }
                 }
                 WM_RBUTTONUP => {
                     if self.mode == Mode::Open {
                         let (x, y) = self.panel_pt(lp);
-                        if let Hover::Row(i) = self.hit(x, y) {
+                        let h = self.hit(x, y);
+                        if let (Tab::Sound, Hover::Vol(n) | Hover::Mute(n)) = (self.tab, h) {
+                            // Right-click an app column: unpin it (it still shows while playing).
+                            if let Some(key) = n.checked_sub(1).and_then(|k| self.mix.get(k)).map(|c| c.key.clone()) {
+                                self.items.mix_pins.retain(|q| !q.eq_ignore_ascii_case(&key));
+                                self.items.save();
+                                self.sample_mix();
+                            }
+                        } else if let Hover::Item(i) = h {
+                            if self.tab == Tab::Shelf {
+                                self.edit = match self.edit {
+                                    Some(e) if e == i => None,
+                                    Some(e) if e > i => Some(e - 1),
+                                    e => e,
+                                };
+                            }
+                            self.item_remove(i);
+                            self.hover = Hover::None;
+                            self.touch();
+                        } else if let Hover::Row(i) | Hover::Pin(i) | Hover::Del(i) = self.hit(x, y) {
                             self.store.remove(i);
                             self.flash = None;
                             self.store.save();
-                            self.scroll = self.scroll.min(self.store.items.len().saturating_sub(self.rows()));
+                            self.scroll = self.scroll.min(self.view().len().saturating_sub(self.rows()));
                             self.hover = Hover::None;
                             self.touch();
                         }
@@ -1642,10 +2808,29 @@ impl Island {
                     let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                     // Precision touchpads send deltas under 120; still move one step.
                     let notches = if delta.abs() >= 120 { delta / 120 } else { delta.signum() };
+                    if self.tab == Tab::Media && self.cfg.media_controls {
+                        let bright = wp.0 & 0x4 != 0; // MK_SHIFT: brightness, plain wheel: volume
+                        let d = notches as f32 * 0.04;
+                        let lv = if bright { media::brightness(self.hwnd, d * 2.5) } else { media::volume(d) };
+                        if let Some(v) = lv {
+                            self.hud = Some((bright, v, Instant::now()));
+                            self.touch();
+                        }
+                    }
+                    if self.picking() {
+                        let max = self.pick_hits.len().saturating_sub(self.pick_rows()) as i32;
+                        let n = (self.pick_scroll as i32 - notches * 3).clamp(0, max) as usize;
+                        if n != self.pick_scroll {
+                            self.pick_scroll = n;
+                            self.hover = Hover::None; // re-hit on next mouse move
+                            self.touch();
+                        }
+                        return Some(LRESULT(0));
+                    }
                     if self.tab != Tab::Clip {
                         return Some(LRESULT(0));
                     }
-                    let max = self.store.items.len().saturating_sub(self.rows()) as i32;
+                    let max =self.view().len().saturating_sub(self.rows()) as i32;
                     let n = (self.scroll as i32 - notches * 2).clamp(0, max) as usize;
                     if n != self.scroll {
                         self.scroll = n;
@@ -1731,6 +2916,34 @@ unsafe fn decode(rt: &ID2D1DCRenderTarget, wic: &IWICImagingFactory, bytes: &[u8
     rt.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(data.as_ptr() as *const _), w * 4, &props).ok()
 }
 
+/// A saved clipboard image shrunk to fit 64x64, so the cache holds a few KB, not a full screenshot.
+unsafe fn thumb(rt: &ID2D1DCRenderTarget, wic: &IWICImagingFactory, path: &str) -> Option<ID2D1Bitmap> {
+    let bytes = std::fs::read(path).ok()?;
+    let stream = wic.CreateStream().ok()?;
+    stream.InitializeFromMemory(&bytes).ok()?;
+    let dec = wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).ok()?;
+    let frame = dec.GetFrame(0).ok()?;
+    let (mut w, mut h) = (0u32, 0u32);
+    frame.GetSize(&mut w, &mut h).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let k = (64.0 / w.max(h) as f32).min(1.0);
+    let (tw, th) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+    let sc = wic.CreateBitmapScaler().ok()?;
+    sc.Initialize(&frame, tw, th, WICBitmapInterpolationModeFant).ok()?;
+    let conv = wic.CreateFormatConverter().ok()?;
+    conv.Initialize(&sc, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+    let mut data = vec![0u8; (tw * th * 4) as usize];
+    conv.CopyPixels(std::ptr::null(), tw * 4, &mut data).ok()?;
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    rt.CreateBitmap(D2D_SIZE_U { width: tw, height: th }, Some(data.as_ptr() as *const _), tw * 4, &props).ok()
+}
+
 unsafe fn create_window() -> Result<HWND> {
     let instance = GetModuleHandleW(None)?;
     let class = WNDCLASSEXW {
@@ -1782,4 +2995,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return r;
     }
     DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// Runs the Open dialog (called on the picker thread, COM already initialised).
+/// Launch filters to apps/shortcuts and keeps .lnk files as-is; Shelf takes anything.
+unsafe fn pick_dialog(shelf: bool, owner: HWND) -> Vec<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_NODEREFERENCELINKS, SIGDN_FILESYSPATH};
+    let mut paths = Vec::new();
+    let Ok(d) = CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) else { return paths };
+    let mut o = FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM;
+    if !shelf {
+        o |= FOS_NODEREFERENCELINKS;
+        let f = [
+            COMDLG_FILTERSPEC { pszName: w!("Apps and shortcuts"), pszSpec: w!("*.exe;*.lnk;*.url;*.bat;*.cmd") },
+            COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+        ];
+        let _ = d.SetFileTypes(&f);
+        let _ = d.SetTitle(w!("Add to Launch"));
+    } else {
+        let _ = d.SetTitle(w!("Add to Shelf"));
+    }
+    let _ = d.SetOptions(o);
+    if d.Show(owner).is_err() {
+        return paths; // cancelled
+    }
+    let Ok(items) = d.GetResults() else { return paths };
+    for i in 0..items.GetCount().unwrap_or(0) {
+        if let Ok(p) = items.GetItemAt(i).and_then(|it| it.GetDisplayName(SIGDN_FILESYSPATH)) {
+            if let Ok(s) = p.to_string() {
+                paths.push(s);
+            }
+            CoTaskMemFree(Some(p.0 as _));
+        }
+    }
+    paths
 }

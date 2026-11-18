@@ -529,3 +529,33 @@ fn thumbnail(props: &windows::Media::Control::GlobalSystemMediaTransportControls
     reader.ReadBytes(&mut buf).ok()?;
     Some(buf)
 }
+
+/// Master volume 0..1 after nudging it by `d` (None: read only). None when no output device.
+pub fn volume(d: f32) -> Option<f32> {
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    unsafe {
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let ep: IAudioEndpointVolume = en.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?.Activate(CLSCTX_ALL, None).ok()?;
+        let mut v = ep.GetMasterVolumeLevelScalar().ok()?;
+        if d != 0.0 {
+            v = (v + d).clamp(0.0, 1.0);
+            ep.SetMasterVolumeLevelScalar(v, std::ptr::null()).ok()?;
+            if v > 0.0 {
+                let _ = ep.SetMute(false, std::ptr::null());
+            }
+        }
+        Some(v)
+    }
+}
+
+/// Brightness 0..1 of the monitor under `hwnd` after nudging it by `d` (DDC/CI or the laptop panel via WMI).
+pub fn brightness(hwnd: HWND, d: f32) -> Option<f32> {
+    let i = super::mixer::monitor_of(hwnd);
+    let cur = super::mixer::brightness(i, None)?;
+    if d == 0.0 {
+        return Some(cur);
+    }
+    super::mixer::brightness(i, Some((cur + d).clamp(0.0, 1.0)))
+}

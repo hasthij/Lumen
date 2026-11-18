@@ -173,7 +173,7 @@ fn watch_dirs() -> Vec<String> {
     .collect()
 }
 
-fn scan() -> Vec<App> {
+pub(crate) fn scan() -> Vec<App> {
     let mut apps = scan_apps_folder();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     for desktop in [format!(r"{}\Desktop", env("USERPROFILE")), format!(r"{}\Desktop", env("PUBLIC"))] {
