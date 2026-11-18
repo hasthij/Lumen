@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "All-in-one Windows customization: desktop clock, launcher, clear taskbar"
@@ -27,6 +27,8 @@ features = [
   "Media_Control",
   "Storage_Streams",
   "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_DirectWrite",

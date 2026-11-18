@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lumen Island UI Tuner</title>
+<style>
+:root{--pad:24;--tabY:14;--tabH:28;--tabGap:4;--tabR:14;--tabPadX:14;--rowH:36;--rowGap:4;--rowR:10;--icon:28;--iconR:8;--iconGap:10;
+--aBase:.04;--aHot:.11;--aTab:.16;--press:.97;--lift:0;--dur:140;--accent:.9;--fs:13;--fsSmall:11;--btn:36;--btnR:18;--bw:560;--cw:560;--ease:cubic-bezier(.2,.7,.2,1)}
+*{box-sizing:border-box}
+body{margin:0;background:#0b0b0c;color:#eee;font:13px/1.4 "Segoe UI",system-ui,sans-serif;display:grid;grid-template-columns:340px 1fr;min-height:100vh}
+aside{padding:16px;border-right:1px solid #222;overflow:auto;max-height:100vh;position:sticky;top:0}
+h1{font-size:14px;margin:0 0 4px}h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#888;margin:18px 0 6px}
+label{display:grid;grid-template-columns:1fr 44px;gap:2px 8px;align-items:center;margin:7px 0;font-size:12px;color:#ccc}
+label input{grid-column:1/-1;width:100%;accent-color:#d8d8e0;cursor:pointer}
+label b{font-weight:500;color:#fff;text-align:right;font-variant-numeric:tabular-nums}
+button.t{background:#1a1a1c;color:#ddd;border:1px solid #2a2a2d;border-radius:8px;padding:8px 12px;cursor:pointer;font:inherit;margin:4px 4px 0 0;transition:background .15s}
+button.t:hover{background:#242427}button.t:focus-visible,input:focus-visible{outline:2px solid #8ab4ff;outline-offset:2px}
+main{display:grid;place-items:start center;padding:32px;gap:24px;align-content:start}
+.panel{width:calc(var(--bw)*1px);max-width:100%;background:#000;border:1px solid #1e1e20;border-radius:22px;padding-bottom:calc(var(--pad)*1px);box-shadow:0 20px 60px #000a}
+.tabs{display:flex;gap:calc(var(--tabGap)*1px);padding:calc(var(--tabY)*1px) calc(var(--pad)*1px) 0;height:calc((var(--tabY) + var(--tabH) + 8)*1px);position:relative}
+.tab{height:calc(var(--tabH)*1px);padding:0 calc(var(--tabPadX)*1px);border-radius:calc(var(--tabR)*1px);border:0;background:transparent;color:#ffffffb3;font:500 calc(var(--fs)*1px) "Segoe UI";cursor:pointer;transition:background calc(var(--dur)*1ms) var(--ease),transform calc(var(--dur)*1ms) var(--ease),color calc(var(--dur)*1ms)}
+.tab:hover{background:rgba(255,255,255,calc(var(--aTab)*.5));color:#fff}.tab.on{background:rgba(255,255,255,var(--aTab));color:#fff}
+.tab:active{transform:scale(var(--press))}
+.clear{margin-left:auto;height:24px;padding:0 12px;border-radius:6px;border:0;background:rgba(255,255,255,.1);color:#fff;font:calc(var(--fsSmall)*1px) "Segoe UI";cursor:pointer;align-self:center;margin-top:calc(var(--tabY)*-.0px);transition:background calc(var(--dur)*1ms),transform calc(var(--dur)*1ms) var(--ease)}
+.clear:hover{background:rgba(255,255,255,.18)}.clear:active{transform:scale(var(--press))}
+.div{height:1px;margin:0 calc(var(--pad)*1px) 7px;background:#ffffff1a}
+.list{padding:0 calc(var(--pad)*1px);display:flex;flex-direction:column;gap:calc(var(--rowGap)*1px)}
+.list[hidden]{display:none}.clear[hidden]{display:none}.row{display:flex;align-items:center;height:calc(var(--rowH)*1px);border-radius:calc(var(--rowR)*1px);background:rgba(255,255,255,var(--aBase));padding:0 12px 0 calc((var(--rowH) - var(--icon))*.5px + 2px);gap:calc(var(--iconGap)*1px);position:relative;cursor:pointer;
+transition:background calc(var(--dur)*1ms) var(--ease),transform calc(var(--dur)*1ms) var(--ease)}
+.row:hover{background:rgba(255,255,255,var(--aHot));transform:translateY(calc(var(--lift)*-1px))}
+.row:active{transform:scale(var(--press))}
+.row::before{content:"";position:absolute;left:0;top:25%;height:50%;width:3px;border-radius:2px;background:rgba(255,255,255,var(--accent));opacity:0;transition:opacity calc(var(--dur)*1ms)}
+.row:hover::before{opacity:1}
+.ic{width:calc(var(--icon)*1px);height:calc(var(--icon)*1px);flex:none;border-radius:calc(var(--iconR)*1px);background:rgba(255,255,255,.09);display:grid;place-items:center;color:#ffffffa0}
+.ic svg{width:60%;height:60%}
+.lb{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:calc(var(--fs)*1px)}
+.mt{font-size:calc(var(--fsSmall)*1px);color:#ffffff73;font-variant-numeric:tabular-nums;white-space:nowrap}
+.card[hidden]{display:none}.card{margin:6px calc(var(--pad)*1px) 0;border-radius:16px;background:rgba(255,255,255,.06);padding:14px;display:flex;gap:14px;align-items:center}
+.art{width:64px;height:64px;border-radius:14px;background:linear-gradient(135deg,#3a3a48,#16161c);flex:none}
+.meta{flex:1;min-width:0}.meta .t1{font-weight:600;font-size:calc(var(--fs)*1px + 1px)}.meta .t2{color:#ffffff80;font-size:calc(var(--fsSmall)*1px)}
+.bar{height:3px;border-radius:2px;background:#ffffff29;margin-top:10px;overflow:hidden}.bar i{display:block;height:100%;width:38%;background:#ffffffe6}
+.ctl{display:flex;gap:calc(var(--rowGap)*2px + 4px);align-items:center}
+.cb{width:calc(var(--btn)*1px);height:calc(var(--btn)*1px);border-radius:calc(var(--btnR)*1px);border:0;background:rgba(255,255,255,.08);color:#fff;cursor:pointer;display:grid;place-items:center;transition:background calc(var(--dur)*1ms) var(--ease),transform calc(var(--dur)*1ms) var(--ease)}
+.cb:hover{background:rgba(255,255,255,var(--aHot)*1.6);transform:translateY(calc(var(--lift)*-1px))}.cb:active{transform:scale(var(--press))}
+.cb.main{background:#fff;color:#000}.cb.main:hover{background:#e8e8ee}
+.cb svg{width:45%;height:45%;fill:currentColor}
+.cb:focus-visible,.row:focus-visible,.tab:focus-visible{outline:2px solid #8ab4ff;outline-offset:2px}
+pre{background:#111;border:1px solid #222;border-radius:10px;padding:12px;font:12px/1.5 Consolas,monospace;color:#bbb;width:calc(var(--bw)*1px);max-width:100%;white-space:pre-wrap;margin:0}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+@media(max-width:800px){body{grid-template-columns:1fr}aside{position:static;max-height:none}}
+</style></head><body>
+<aside>
+<h1>Lumen island tuner</h1><div style="color:#888;font-size:12px">Starts at current values. Drag, hover, press the preview.</div>
+<div id="ctl"></div>
+<h2>Presets</h2>
+<button class="t" data-p="current">Current</button><button class="t" data-p="airy">Airy</button><button class="t" data-p="tight">Compact</button><button class="t" data-p="soft">Soft + bouncy</button>
+<h2>Output</h2><button class="t" id="reset">Reset</button><button class="t" id="copy">Copy Rust values</button>
+</aside>
+<main>
+<div class="panel" id="panel">
+<div class="tabs"><button class="tab on">Clipboard</button><button class="tab">Media</button><button class="clear" id="clr">Clear all</button></div>
+<div class="div"></div>
+<div class="list" id="list"></div>
+<div class="card" id="card" hidden><div class="art"></div><div class="meta"><div class="t1">Midnight City</div><div class="t2">M83 · Spotify</div><div class="bar"><i></i></div></div>
+<div class="ctl"><button class="cb" aria-label="Previous"><svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg></button><button class="cb main" aria-label="Pause"><svg viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg></button><button class="cb" aria-label="Next"><svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg></button></div></div>
+</div>
+<pre id="out"></pre>
+</main>
+<script>
+const list=document.getElementById("list"),clr=document.getElementById("clr"),card=document.getElementById("card");
+const S=[ // key, label, min, max, step, default, group, css unit, rust name
+["pad","Side padding",8,40,1,24,"Layout","px","PAD"],
+["tabY","Tab bar top",6,28,1,14,"Layout","px","TAB_Y"],
+["tabH","Tab height",22,44,1,28,"Layout","px","TAB_H"],
+["tabGap","Tab gap",0,16,1,4,"Layout","px","TAB_GAP"],
+["tabPadX","Tab inner padding",8,28,1,14,"Layout","px","TAB_PAD_X"],
+["tabR","Tab radius",4,22,1,14,"Layout","px","TAB_R"],
+["rowH","Row height",28,56,1,36,"Rows","px","ROW_H"],
+["rowGap","Row gap",0,14,1,4,"Rows","px","ROW_GAP"],
+["rowR","Row radius",0,22,1,10,"Rows","px","ROW_R"],
+["icon","Icon size",18,40,1,28,"Rows","px","ICON"],
+["iconR","Icon radius",0,20,1,8,"Rows","px","ICON_R"],
+["iconGap","Icon → label gap",4,20,1,10,"Rows","px","ICON_GAP"],
+["fs","Body font",11,17,1,13,"Type","px","FONT"],
+["fsSmall","Small font",9,14,1,11,"Type","px","FONT_SMALL"],
+["btn","Media button size",28,56,1,36,"Buttons","px","BTN"],
+["btnR","Media button radius",4,28,1,18,"Buttons","px","BTN_R"],
+["aBase","Row fill (rest)",0,.2,.01,.04,"Feedback","","A_ROW"],
+["aHot","Row fill (hover)",0,.3,.01,.11,"Feedback","","A_HOT"],
+["aTab","Active tab fill",0,.3,.01,.16,"Feedback","","A_TAB"],
+["accent","Hover accent bar",0,1,.05,.9,"Feedback","","A_ACCENT"],
+["press","Press scale",.9,1,.005,.97,"Feedback","","PRESS"],
+["lift","Hover lift",0,4,.5,0,"Feedback","px","LIFT"],
+["dur","Transition",0,400,10,140,"Feedback","ms","ANIM_MS"],
+["bw","Panel width",420,720,10,560,"Layout","px","W"]];
+const P={airy:{pad:28,rowH:40,rowGap:6,rowR:12,icon:30,iconR:10,iconGap:12,tabH:30,tabGap:6,btn:40,btnR:20,aHot:.13,dur:160,lift:1},
+tight:{pad:18,rowH:32,rowGap:2,rowR:8,icon:24,iconR:6,iconGap:8,tabH:26,btn:32,btnR:16},
+soft:{pad:26,rowH:42,rowGap:6,rowR:16,icon:30,iconR:12,tabR:16,btnR:20,btn:40,aBase:.06,aHot:.14,press:.95,lift:1.5,dur:220}};
+const r=document.documentElement.style,ctl=document.getElementById("ctl");let g="",v={};
+S.forEach(([k,l,mn,mx,st,d,grp,u])=>{if(grp!==g){g=grp;ctl.insertAdjacentHTML("beforeend",`<h2>${g}</h2>`)}
+ctl.insertAdjacentHTML("beforeend",`<label>${l}<b id="v_${k}"></b><input type="range" id="i_${k}" min="${mn}" max="${mx}" step="${st}" value="${d}" aria-label="${l}"></label>`);
+document.getElementById("i_"+k).oninput=e=>set(k,+e.target.value)});
+function set(k,x){const s=S.find(a=>a[0]==k),u=s[7];v[k]=x;r.setProperty("--"+k,x);document.getElementById("v_"+k).textContent=x+(u&&u!="px"?u:"");document.getElementById("i_"+k).value=x;out()}
+function out(){document.getElementById("out").textContent="// island/mod.rs constants\n"+S.map(s=>`const ${s[8]}: f32 = ${(+v[s[0]]).toString()};`).join("\n")}
+function load(o){S.forEach(s=>set(s[0],o&&o[s[0]]!=null?o[s[0]]:s[5]))}
+const rows=[["Quarterly report.pdf","2.4 MB","now",1],["https://github.com/hasthij/Lumen","","2m",0],["Meeting notes — draft v3","","14m",0],["screenshot.png","812 KB","1h",1],["npm install --save-dev vitest","","3h",0]];
+const f='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',t='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 7h14M5 12h14M5 17h9"/></svg>';
+document.getElementById("list").innerHTML=rows.map(a=>`<div class="row" tabindex="0" role="button"><div class="ic">${a[3]?f:t}</div><div class="lb">${a[0]}</div><span class="mt">${a[1]}</span><span class="mt" style="min-width:26px;text-align:right">${a[2]}</span></div>`).join("");
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");const m=b.textContent=="Media";list.hidden=m;clr.hidden=m;card.hidden=!m});
+document.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>load(b.dataset.p=="current"?null:P[b.dataset.p]));
+document.getElementById("reset").onclick=()=>load();
+document.getElementById("copy").onclick=e=>{navigator.clipboard.writeText(document.getElementById("out").textContent).then(()=>{e.target.textContent="Copied";setTimeout(()=>e.target.textContent="Copy Rust values",1200)}).catch(()=>{})};
+load();
+</script></body></html>

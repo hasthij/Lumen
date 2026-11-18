@@ -132,7 +132,11 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
     let mut last_primary = String::new();
     let mut sp_pid = 0u32;
     // Cover for the Spotify stand-in, looked up on a helper thread once per track.
-    let fb_art: Arc<Mutex<Option<(String, Arc<Vec<u8>>)>>> = Arc::new(Mutex::new(None));
+    let fb_art: Arc<Mutex<Option<(String, Arc<Vec<u8>>, f64)>>> = Arc::new(Mutex::new(None));
+    // Spotify exposes no timeline: count playing time ourselves (seeks are not seen).
+    let mut fb_pos = 0.0f64;
+    let mut fb_tick = Instant::now();
+    let mut fb_prev_playing = false;
     let mut fb_key = String::new();
     let mut fb_gen = 0u32;
     let mut fb_have = false;
@@ -209,7 +213,8 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
                     last_track = Some(tr);
                     last_playing = true;
                 } else {
-                    last_playing = false;
+                    // Tray-minimised Spotify has no track window: judge by whether it makes sound.
+                    last_playing = last_track.is_some() && spotify_audible();
                 }
                 if let Some((title, artist)) = last_track.clone() {
                     let key = format!("{artist}\u{1}{title}");
@@ -217,23 +222,29 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
                         fb_key = key.clone();
                         fb_have = false;
                         fb_gen += 1;
+                        fb_pos = 0.0;
                         let slot = fb_art.clone();
                         let q = format!("{artist} {title}");
                         std::thread::spawn(move || {
-                            if let Some(bytes) = fetch_cover(&q) {
-                                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Arc::new(bytes)));
+                            if let Some((bytes, dur)) = fetch_cover(&q) {
+                                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Arc::new(bytes), dur));
                             }
                         });
                     }
-                    let art = match fb_art.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                        Some((k, b)) if *k == fb_key => Some(b.clone()),
-                        _ => None,
+                    let (art, dur) = match fb_art.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        Some((k, b, d)) if *k == fb_key => (Some(b.clone()), *d),
+                        _ => (None, 0.0),
                     };
+                    if fb_prev_playing {
+                        fb_pos += fb_tick.elapsed().as_secs_f64();
+                    }
+                    fb_tick = Instant::now();
+                    fb_prev_playing = last_playing;
                     if art.is_some() && !fb_have {
                         fb_have = true;
                         fb_gen += 1;
                     }
-                    fresh.push(Media { id: FALLBACK.into(), title, artist, playing: last_playing, pos: 0.0, dur: 0.0, at: Instant::now(), art, art_gen: fb_gen });
+                    fresh.push(Media { id: FALLBACK.into(), title, artist, playing: last_playing, pos: fb_pos.min(if dur > 0.0 { dur } else { f64::MAX }), dur, at: Instant::now(), art, art_gen: fb_gen });
                 }
             }
         }
@@ -258,7 +269,7 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
 
 /// Looks a cover up on the iTunes Search API (no key) with the system curl. Only the track text
 /// leaves the machine. Blocking: call from a helper thread.
-fn fetch_cover(query: &str) -> Option<Vec<u8>> {
+fn fetch_cover(query: &str) -> Option<(Vec<u8>, f64)> {
     use std::os::windows::process::CommandExt;
     let run = |args: &[&str]| -> Option<Vec<u8>> {
         let out = std::process::Command::new("curl.exe").args(args).creation_flags(0x0800_0000).output().ok()?;
@@ -267,6 +278,11 @@ fn fetch_cover(query: &str) -> Option<Vec<u8>> {
     let term = format!("term={query}");
     let json = run(&["-s", "-m", "8", "-G", "https://itunes.apple.com/search", "--data-urlencode", &term, "-d", "entity=song", "-d", "limit=1"])?;
     let json = String::from_utf8_lossy(&json);
+    let dur = json
+        .find("\"trackTimeMillis\":")
+        .and_then(|i| json[i + 18..].trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        / 1000.0;
     let at = json.find("\"artworkUrl100\"")? + "\"artworkUrl100\"".len();
     let rest = &json[at..];
     let start = rest.find('"')? + 1;
@@ -277,7 +293,7 @@ fn fetch_cover(query: &str) -> Option<Vec<u8>> {
     }
     let bytes = run(&["-s", "-m", "10", &url])?;
     crate::info!("island media: cover fetched ({} bytes)", bytes.len());
-    Some(bytes)
+    Some((bytes, dur))
 }
 
 /// Readable app name for a session id (AUMID or exe path). Browsers registered under a random
@@ -370,6 +386,41 @@ fn scan_impl(want: u32, found_pid: &mut u32) -> Option<Option<(String, String)>>
     }
     *found_pid = acc.pid;
     Some(acc.found.and_then(|t| t.split_once(" - ").map(|(a, s)| (s.trim().to_string(), a.trim().to_string()))))
+}
+
+/// True when a spotify.exe audio session is active and has a non-silent peak.
+fn spotify_audible() -> bool {
+    use windows::core::Interface;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
+    use windows::Win32::Media::Audio::{eMultimedia, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let run = || -> windows::core::Result<bool> {
+            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let dev = en.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+            let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None)?;
+            let list = mgr.GetSessionEnumerator()?;
+            for i in 0..list.GetCount()? {
+                let ctl = list.GetSession(i)?;
+                if ctl.GetState()? != AudioSessionStateActive {
+                    continue;
+                }
+                let pid = ctl.cast::<IAudioSessionControl2>()?.GetProcessId()?;
+                let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { continue };
+                let mut buf = [0u16; 520];
+                let mut n = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+                let _ = CloseHandle(p);
+                if ok && String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase().ends_with("\\spotify.exe") && ctl.cast::<IAudioMeterInformation>()?.GetPeakValue()? > 0.0005 {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        run().unwrap_or(false)
+    }
 }
 
 /// Global media key: Spotify (and most players) react to it even without a Windows media session.

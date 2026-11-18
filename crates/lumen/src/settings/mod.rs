@@ -114,6 +114,7 @@ enum Hit {
     IslandAnim(&'static str),
     IslandBg(u32),
     IslandOutline,
+    IslandPaste,
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -492,6 +493,10 @@ impl Settings {
             }
             Hit::IslandBg(c) => {
                 self.cfg.island.bg = theme::to_hex(theme::rgb(c));
+                self.commit_config();
+            }
+            Hit::IslandPaste => {
+                self.cfg.island.paste_on_click = !self.cfg.island.paste_on_click;
                 self.commit_config();
             }
             Hit::IslandOutline => {
@@ -1392,6 +1397,10 @@ impl Settings {
         y = self.section("Island", y);
         self.card(y, 68.0, Some(('\u{E7F4}', None)), "Island", "Hidden until the cursor reaches the screen edge");
         self.toggle(right, y + 34.0, self.cfg.modules.island, Hit::Module("island"), true);
+        y += 72.0;
+
+        self.card(y, 68.0, Some(('\u{E77F}', None)), "Paste on click", "Clicking a clipboard item also pastes it into the focused field");
+        self.toggle(right, y + 34.0, self.cfg.island.paste_on_click, Hit::IslandPaste, true);
         y += 72.0;
 
         self.card(y, 68.0, Some(('\u{E7C9}', None)), "Dock side", "Which screen edge it grows from");

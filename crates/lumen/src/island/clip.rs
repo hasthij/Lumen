@@ -2,18 +2,17 @@
 //! Files are only ever stored as paths and put back on the clipboard; nothing is opened or run.
 
 use serde::{Deserialize, Serialize};
-use windows::core::{w, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HANDLE, HGLOBAL, HWND, S_OK};
+use windows::core::{w, HRESULT};
+use windows::Win32::Foundation::{GlobalFree, BOOL, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, OLE_E_ADVISENOTSUPPORTED, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HANDLE, HGLOBAL, HWND, S_OK};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
-use windows::Win32::System::Com::{CoTaskMemFree, IDataObject, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+use windows::Win32::System::Com::{IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
 use windows::Win32::System::Ole::{DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{DragQueryFileW, SHCreateDataObject, SHParseDisplayName, DROPFILES, HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, SHCreateStdEnumFmtEtc, DROPFILES, HDROP};
 
 const MAX_TEXT: usize = 20_000;
 const MAX_ENTRIES: usize = 200;
@@ -25,6 +24,13 @@ pub struct Entry {
     /// `s` is newline-separated file paths.
     pub files: bool,
     pub s: String,
+    /// Total bytes of the files, measured once when copied and saved with the history.
+    #[serde(default)]
+    pub size: u64,
+}
+
+fn files_size(s: &str) -> u64 {
+    s.lines().filter_map(|p| std::fs::metadata(p).ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -57,6 +63,11 @@ impl Store {
             .map(|d| d.e)
             .unwrap_or_default();
         let mut s = Store { items, days, dirty: false };
+        // Entries saved before sizes existed: measure once, then they persist.
+        for e in s.items.iter_mut().filter(|e| e.files && e.size == 0) {
+            e.size = files_size(&e.s);
+            s.dirty = true;
+        }
         s.prune();
         s
     }
@@ -84,7 +95,7 @@ impl Store {
         }
         // Move an existing identical entry to the top instead of duplicating it.
         self.items.retain(|e| !(e.files == files && e.s == s));
-        self.items.insert(0, Entry { t: now(), files, s });
+        self.items.insert(0, Entry { t: now(), files, size: if files { files_size(&s) } else { 0 }, s });
         self.prune();
         self.dirty = true;
     }
@@ -284,7 +295,7 @@ impl IDropSource_Impl for Src_Impl {
 /// through a real shell data object (built from item ids) so Explorer, browsers and chat apps accept them.
 pub fn drag(e: &Entry) {
     unsafe {
-        let data: Option<IDataObject> = if e.files { shell_data(e) } else { text_data(e) };
+        let data: Option<IDataObject> = if e.files { files_data(e) } else { text_data(e) };
         let Some(data) = data else {
             crate::warn!("island: drag skipped, nothing to drag");
             return;
@@ -296,62 +307,101 @@ pub fn drag(e: &Entry) {
     }
 }
 
-unsafe fn text_data(e: &Entry) -> Option<IDataObject> {
-    let (format, mem) = build(e)?;
-    let data = SHCreateDataObject::<_, IDataObject>(None, None, None::<&IDataObject>).ok();
-    let Some(data) = data else {
-        let _ = GlobalFree(mem);
-        return None;
-    };
-    let fmt = FORMATETC { cfFormat: format as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
-    let medium = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: mem }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
-    if data.SetData(&fmt, &medium, true).is_err() {
-        let _ = GlobalFree(mem);
-        return None;
-    }
-    // Many drop targets (older editors, terminals) only ask for ANSI text; offer it for ASCII.
-    if e.s.is_ascii() {
-        let bytes: Vec<u8> = e.s.bytes().chain(std::iter::once(0)).collect();
-        if let Ok(m) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
-            let p = GlobalLock(m) as *mut u8;
-            if p.is_null() {
-                let _ = GlobalFree(m);
-            } else {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
-                let _ = GlobalUnlock(m);
-                let f = FORMATETC { cfFormat: CF_TEXT.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
-                let med = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: m }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
-                if data.SetData(&f, &med, true).is_err() {
-                    let _ = GlobalFree(m);
-                }
-            }
-        }
-    }
-    Some(data)
+/// Plain text data object: unicode (and ANSI when ASCII) served straight from memory. Chat apps
+/// (Telegram, Discord) are pickier about the shell's generic object than about this one.
+#[windows::core::implement(IDataObject)]
+struct TextData {
+    fmts: Vec<(u16, Vec<u8>)>,
 }
 
-unsafe fn shell_data(e: &Entry) -> Option<IDataObject> {
-    let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
-    for p in e.s.lines().filter(|p| std::path::Path::new(p).exists()) {
-        let wide: Vec<u16> = p.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
-            pidls.push(pidl);
+impl TextData {
+    fn find(&self, f: *const FORMATETC) -> Option<&Vec<u8>> {
+        let f = unsafe { &*f };
+        if f.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+            return None;
+        }
+        self.fmts.iter().find(|(c, _)| *c == f.cfFormat).map(|(_, d)| d)
+    }
+}
+
+impl IDataObject_Impl for TextData_Impl {
+    fn GetData(&self, pformatetcin: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        let data = self.find(pformatetcin).ok_or(windows::core::Error::from(DV_E_FORMATETC))?;
+        unsafe {
+            let mem = GlobalAlloc(GMEM_MOVEABLE, data.len())?;
+            let p = GlobalLock(mem) as *mut u8;
+            if p.is_null() {
+                let _ = GlobalFree(mem);
+                return Err(E_OUTOFMEMORY.into());
+            }
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+            let _ = GlobalUnlock(mem);
+            Ok(STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: mem }, pUnkForRelease: std::mem::ManuallyDrop::new(None) })
         }
     }
-    if pidls.is_empty() {
+    fn GetDataHere(&self, _: *const FORMATETC, _: *mut STGMEDIUM) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
+        if self.find(pformatetc).is_some() { S_OK } else { DV_E_FORMATETC }
+    }
+    fn GetCanonicalFormatEtc(&self, _: *const FORMATETC, _: *mut FORMATETC) -> HRESULT {
+        DATA_S_SAMEFORMATETC
+    }
+    fn SetData(&self, _: *const FORMATETC, _: *const STGMEDIUM, _: BOOL) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn EnumFormatEtc(&self, dwdirection: u32) -> windows::core::Result<IEnumFORMATETC> {
+        if dwdirection != DATADIR_GET.0 as u32 {
+            return Err(E_NOTIMPL.into());
+        }
+        let list: Vec<FORMATETC> = self
+            .fmts
+            .iter()
+            .map(|(c, _)| FORMATETC { cfFormat: *c, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 })
+            .collect();
+        unsafe { SHCreateStdEnumFmtEtc(&list) }
+    }
+    fn DAdvise(&self, _: *const FORMATETC, _: u32, _: Option<&IAdviseSink>) -> windows::core::Result<u32> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+    fn DUnadvise(&self, _: u32) -> windows::core::Result<()> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+    fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+        Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+/// CF_HDROP bytes: DROPFILES header (pFiles=20, pt=(0,0), fNC=0, fWide=1), then NUL-separated
+/// wide paths ended by a double NUL.
+fn hdrop(paths: &[&str]) -> Vec<u8> {
+    let mut b: Vec<u8> = [20u32, 0, 0, 0, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    for p in paths {
+        b.extend(p.encode_utf16().chain([0]).flat_map(|u| u.to_le_bytes()));
+    }
+    b.extend([0, 0]);
+    b
+}
+
+fn text_data(e: &Entry) -> Option<IDataObject> {
+    let mut fmts = vec![(CF_UNICODETEXT.0, e.s.encode_utf16().chain(std::iter::once(0)).flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>())];
+    // Many drop targets (older editors, terminals) only ask for ANSI text; offer it for ASCII.
+    if e.s.is_ascii() {
+        fmts.push((CF_TEXT.0, e.s.bytes().chain(std::iter::once(0)).collect()));
+    }
+    // Chat apps often only accept files: also offer the text as a temp .txt (CF_HDROP).
+    let tmp = std::env::temp_dir().join("Lumen-clip.txt");
+    if std::fs::write(&tmp, &e.s).is_ok() {
+        fmts.push((CF_HDROP.0, hdrop(&[&tmp.to_string_lossy()])));
+    }
+    Some(TextData { fmts }.into())
+}
+
+fn files_data(e: &Entry) -> Option<IDataObject> {
+    let paths: Vec<&str> = e.s.lines().filter(|p| std::path::Path::new(p).exists()).collect();
+    if paths.is_empty() {
         return None;
     }
-    let list: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-    let data = SHCreateDataObject::<_, IDataObject>(None, Some(&list), None::<&IDataObject>);
-    for p in pidls {
-        CoTaskMemFree(Some(p as *const _));
-    }
-    match data {
-        Ok(d) => Some(d),
-        Err(err) => {
-            crate::warn!("island: SHCreateDataObject failed: {err}");
-            None
-        }
-    }
+    Some(TextData { fmts: vec![(CF_HDROP.0, hdrop(&paths))] }.into())
 }

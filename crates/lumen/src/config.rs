@@ -50,6 +50,8 @@ pub struct IslandConfig {
     pub outline: bool,
     /// Days of clipboard history kept, 1-30.
     pub history_days: u32,
+    /// Clicking a clipboard row also pastes it (Ctrl+V) into the focused app.
+    pub paste_on_click: bool,
 }
 
 impl Default for IslandConfig {
@@ -63,6 +65,7 @@ impl Default for IslandConfig {
             opacity: 0.92,
             outline: true,
             history_days: 7,
+            paste_on_click: false,
         }
     }
 }

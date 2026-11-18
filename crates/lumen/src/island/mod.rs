@@ -22,7 +22,22 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, SendInput, SetCapture, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    VIRTUAL_KEY, VK_CONTROL, VK_LBUTTON, VK_V,
+};
+
+/// Ctrl+V to whatever app has focus (the island never takes focus).
+fn send_paste() {
+    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
+        },
+    };
+    let seq = [key(VK_CONTROL, false), key(VK_V, false), key(VK_V, true), key(VK_CONTROL, true)];
+    unsafe { SendInput(&seq, std::mem::size_of::<INPUT>() as i32) };
+}
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -52,7 +67,19 @@ const MAX_PLAYERS: usize = 3;
 const MULTI_W: f32 = 560.0; // top dock, per player when more than one
 const MULTI_H: f32 = 172.0; // side docks, per player when more than one
 const MULTI_Y: f32 = 58.0;
-const TABS: [(f32, f32, Tab); 2] = [(24.0, 96.0, Tab::Clip), (124.0, 76.0, Tab::Media)];
+// Tuned list/button metrics (design units).
+const ROW_H: f32 = 42.0;
+const ROW_GAP: f32 = 6.0;
+const ROW_PITCH: f32 = ROW_H + ROW_GAP;
+const BTN: f32 = 40.0;
+const BTN_R: f32 = 7.0;
+
+const PAD: f32 = 26.0;
+const TAB_GAP: f32 = 4.0;
+const TAB_R: f32 = 16.0;
+const PRESS: f32 = 0.95;
+const LIFT: f32 = 1.5;
+const TABS: [(f32, f32, Tab); 2] = [(PAD, 96.0, Tab::Clip), (PAD + 96.0 + TAB_GAP, 76.0, Tab::Media)];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -130,7 +157,7 @@ impl Fonts {
         let c = DWRITE_TEXT_ALIGNMENT_CENTER;
         Ok(Fonts {
             title: mk(dw, ui, 15.0, 600, l)?,
-            body: mk(dw, ui, 12.0, 400, l)?,
+            body: mk(dw, ui, 13.0, 400, l)?,
             small: mk(dw, ui, 11.0, 400, l)?,
             small_r: mk(dw, ui, 11.0, 400, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             center: mk(dw, ui, 12.0, 400, c)?,
@@ -177,6 +204,17 @@ fn age(t: u64) -> String {
     }
 }
 
+fn size_label(e: &clip::Entry) -> String {
+    let b = e.size;
+    match b {
+        0 => String::new(),
+        1..=1023 => format!("{b} B"),
+        1024..=1048575 => format!("{:.0} KB", b as f64 / 1024.0),
+        1048576..=1073741823 => format!("{:.1} MB", b as f64 / 1048576.0),
+        _ => format!("{:.1} GB", b as f64 / 1073741824.0),
+    }
+}
+
 fn row_label(e: &clip::Entry) -> String {
     if e.files {
         let names: Vec<&str> = e.s.lines().map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p)).collect();
@@ -220,6 +258,44 @@ impl Ctx<'_> {
         let wide: Vec<u16> = s.encode_utf16().collect();
         self.rt.DrawText(&wide, f, &rect(self.ox + x, self.oy + y, w, h), self.br, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
     }
+    /// Vector transport icon (0 play, 1 pause, 2 previous, 3 next) of half-size `s` centred on (x, y).
+    unsafe fn icon(&self, kind: u8, x: f32, y: f32, s: f32, dark: bool, a: f32) {
+        if dark {
+            self.br.SetColor(&color(0.04, 0.04, 0.06, a * self.alpha));
+        } else {
+            self.col(a);
+        }
+        let tri = |p: [(f32, f32); 3]| {
+            let Ok(f) = self.rt.GetFactory().and_then(|f| f.CreatePathGeometry()) else { return };
+            let Ok(sink) = f.Open() else { return };
+            let pt = |(px, py): (f32, f32)| D2D_POINT_2F { x: self.ox + px, y: self.oy + py };
+            sink.BeginFigure(pt(p[0]), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(pt(p[1]));
+            sink.AddLine(pt(p[2]));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            let _ = sink.Close();
+            self.rt.FillGeometry(&f, self.br, None);
+        };
+        let bar = |bx: f32, bw: f32| {
+            let rr = D2D1_ROUNDED_RECT { rect: rect(self.ox + bx, self.oy + y - s * 0.5, bw, s), radiusX: bw * 0.3, radiusY: bw * 0.3 };
+            self.rt.FillRoundedRectangle(&rr, self.br);
+        };
+        match kind {
+            0 => tri([(x - 0.3 * s, y - 0.55 * s), (x - 0.3 * s, y + 0.55 * s), (x + 0.55 * s, y)]),
+            1 => {
+                bar(x - 0.45 * s, 0.34 * s);
+                bar(x + 0.11 * s, 0.34 * s);
+            }
+            2 => {
+                bar(x - 0.55 * s, 0.17 * s);
+                tri([(x + 0.55 * s, y - 0.5 * s), (x + 0.55 * s, y + 0.5 * s), (x - 0.3 * s, y)]);
+            }
+            _ => {
+                bar(x + 0.38 * s, 0.17 * s);
+                tri([(x - 0.55 * s, y - 0.5 * s), (x - 0.55 * s, y + 0.5 * s), (x + 0.3 * s, y)]);
+            }
+        }
+    }
     unsafe fn circle(&self, x: f32, y: f32, r: f32, a: f32) {
         self.col(a);
         let e = D2D1_ELLIPSE { point: D2D_POINT_2F { x: self.ox + x, y: self.oy + y }, radiusX: r, radiusY: r };
@@ -258,6 +334,11 @@ pub struct Island {
     anim: std::collections::HashMap<String, (f32, f32, f32)>,
     anim_t: Instant,
     animating: bool,
+    /// Row hover lift / press squash progress (0..1) for row `row_i`.
+    row_t: f32,
+    press_t: f32,
+    row_i: usize,
+    row_anim: bool,
     s: f32,
     org: (i32, i32),
     mon: RECT,
@@ -323,6 +404,10 @@ impl Island {
                 anim: Default::default(),
                 anim_t: now,
                 animating: false,
+                row_t: 0.0,
+                press_t: 0.0,
+                row_i: 0,
+                row_anim: false,
                 s: 1.0,
                 org: (0, 0),
                 mon: RECT::default(),
@@ -393,9 +478,9 @@ impl Island {
     fn tile(&self, i: usize) -> (f32, f32, f32, f32) {
         let i = i as f32;
         if self.side == Side::Top {
-            (self.player_w() * self.players.max(1) as f32 - 24.0 + TILE_GAP + i * (TILE_W + TILE_GAP), 58.0, TILE_W, 178.0)
+            (self.player_w() * self.players.max(1) as f32 - PAD + TILE_GAP + i * (TILE_W + TILE_GAP), 58.0, TILE_W, 178.0)
         } else {
-            (24.0, self.tiles_y() + i * (TILE_H + TILE_GAP), SIDE_BOX.0 - 48.0, TILE_H)
+            (PAD, self.tiles_y() + i * (TILE_H + TILE_GAP), SIDE_BOX.0 - 2.0 * PAD, TILE_H)
         }
     }
 
@@ -454,7 +539,7 @@ impl Island {
 
     /// Clipboard rows that fit under the tab bar.
     fn rows(&self) -> usize {
-        (((self.cb().1 - 72.0) / 40.0) as usize).max(1)
+        (((self.cb().1 - 72.0 + ROW_GAP) / ROW_PITCH) as usize).max(1)
     }
 
     /// Layout of player `i`; players share the box equally, tiles get the extra space cb() adds.
@@ -464,16 +549,16 @@ impl Island {
             let pw = self.player_w();
             let x0 = i * pw;
             let tx = x0 + 218.0;
-            let tw = pw - 24.0 - 218.0;
+            let tw = pw - PAD - 218.0;
             let mid = tx + tw / 2.0;
-            Lay { art: (x0 + 24.0, 62.0, 170.0), tx, tw, ty: 66.0, sy: 150.0, cy: 206.0, cxs: [mid - 64.0, mid, mid + 64.0] }
+            Lay { art: (x0 + PAD, 62.0, 170.0), tx, tw, ty: 66.0, sy: 150.0, cy: 206.0, cxs: [mid - 64.0, mid, mid + 64.0] }
         } else if self.players.max(1) == 1 {
             let w = SIDE_BOX.0;
-            Lay { art: ((w - 200.0) / 2.0, 60.0, 200.0), tx: 24.0, tw: w - 48.0, ty: 276.0, sy: 340.0, cy: 408.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0] }
+            Lay { art: ((w - 200.0) / 2.0, 60.0, 200.0), tx: PAD, tw: w - 2.0 * PAD, ty: 276.0, sy: 340.0, cy: 408.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0] }
         } else {
             let w = SIDE_BOX.0;
             let y0 = MULTI_Y + i * MULTI_H;
-            Lay { art: (24.0, y0 + 6.0, 84.0), tx: 124.0, tw: w - 148.0, ty: y0 + 4.0, sy: y0 + 72.0, cy: y0 + 140.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0] }
+            Lay { art: (PAD, y0 + 6.0, 84.0), tx: PAD + 100.0, tw: w - PAD - 124.0, ty: y0 + 4.0, sy: y0 + 72.0, cy: y0 + 140.0, cxs: [w / 2.0 - 60.0, w / 2.0, w / 2.0 + 60.0] }
         }
     }
 
@@ -679,12 +764,34 @@ impl Island {
         true
     }
 
+    /// Eases the hovered row's lift and the pressed row's squash; true while still moving.
+    fn step_rows(&mut self, dt: f32) -> bool {
+        let k = dt / (self.cfg.animation_ms.max(1) as f32 / 1000.0);
+        let instant = self.instant();
+        let mut tgt = 0.0;
+        if let Hover::Row(i) = self.hover {
+            if i != self.row_i {
+                self.row_i = i;
+                self.row_t = 0.0;
+            }
+            tgt = 1.0;
+        }
+        let ptgt = if self.press.is_some() { 1.0 } else { 0.0 };
+        let ease = |v: f32, t: f32| if instant { t } else if v < t { (v + k).min(t) } else { (v - k).max(t) };
+        let (a, b) = (ease(self.row_t, tgt), ease(self.press_t, ptgt));
+        let moving = a != self.row_t || b != self.press_t;
+        self.row_t = a;
+        self.press_t = b;
+        moving
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
         unsafe { self.pointer(now) };
         let moving = self.step(dt);
+        self.row_anim = self.step_rows(dt);
         let mut flashing = false;
         if let Some((_, t)) = self.flash {
             if t.elapsed() < Duration::from_millis(900) {
@@ -713,7 +820,7 @@ impl Island {
                 unsafe { self.release_surface() };
             }
         }
-        if self.shown && (moving || self.dirty || flashing || self.animating) {
+        if self.shown && (moving || self.dirty || flashing || self.animating || self.row_anim) {
             unsafe {
                 if self.paint().is_err() {
                     let _ = self.paint();
@@ -722,7 +829,7 @@ impl Island {
             self.dirty = false;
             self.last_draw = now;
         }
-        self.timer(if moving || self.dirty || flashing || self.animating { 16 } else if self.mode == Mode::Hidden { 10 } else { 33 });
+        self.timer(if moving || self.dirty || flashing || self.animating || self.row_anim { 16 } else if self.mode == Mode::Hidden { 10 } else { 33 });
     }
 
     unsafe fn pointer(&mut self, now: Instant) {
@@ -967,9 +1074,9 @@ impl Island {
             let label = if tab == Tab::Clip { "Clipboard" } else { "Media" };
             let on = self.tab == tab;
             if on {
-                c.rrect(x, 14.0, w, 28.0, 14.0, 0.16);
+                c.rrect(x, 14.0, w, 28.0, TAB_R, 0.16);
             } else if self.hover == Hover::Tab(tab) {
-                c.rrect(x, 14.0, w, 28.0, 14.0, 0.08);
+                c.rrect(x, 14.0, w, 28.0, TAB_R, 0.08);
             }
             c.text(label, &fo.center, x, 14.0, w, 28.0, if on { 1.0 } else { 0.55 });
             if tab == Tab::Media && sessions.iter().any(|s| s.playing) {
@@ -977,14 +1084,14 @@ impl Island {
             }
         }
         // Thin divider under the header.
-        c.rrect(24.0, 49.0, bw - 48.0, 1.0, 0.5, 0.1);
+        c.rrect(PAD, 49.0, bw - 2.0 * PAD, 1.0, 0.5, 0.1);
 
         if self.tab == Tab::Clip {
-            let cw = bw - 48.0;
+            let cw = bw - 2.0 * PAD;
             if self.hover == Hover::Clear {
-                c.rrect(bw - 24.0 - 66.0, 16.0, 66.0, 24.0, 6.0, 0.1);
+                c.rrect(bw - PAD - 66.0, 16.0, 66.0, 24.0, 6.0, 0.1);
             }
-            c.text("Clear", &fo.center, bw - 24.0 - 66.0, 16.0, 66.0, 24.0, 0.6);
+            c.text("Clear", &fo.center, bw - PAD - 66.0, 16.0, 66.0, 24.0, 0.6);
             let first = self.scroll;
             let icons: Vec<Option<ID2D1Bitmap>> = (0..self.rows())
                 .map(|i| {
@@ -998,36 +1105,52 @@ impl Island {
                 .collect();
             let items = &self.store.items;
             if items.is_empty() {
-                c.text("\u{E8C8}", &fo.icon_big, 24.0, 90.0, cw, 36.0, 0.3);
-                c.text("Nothing copied yet", &fo.center, 24.0, 130.0, cw, 24.0, 0.7);
-                c.text("Copy text or files and they show up here", &fo.center, 24.0, 156.0, cw, 18.0, 0.4);
+                c.text("\u{E8C8}", &fo.icon_big, PAD, 90.0, cw, 36.0, 0.3);
+                c.text("Nothing copied yet", &fo.center, PAD, 130.0, cw, 24.0, 0.7);
+                c.text("Copy text or files and they show up here", &fo.center, PAD, 156.0, cw, 18.0, 0.4);
             } else {
-                c.text(&format!("{} items", items.len()), &fo.small, 24.0 + 190.0, 14.0, 90.0, 28.0, 0.4);
+                c.text(&format!("{} items", items.len()), &fo.small, PAD + 190.0, 14.0, 90.0, 28.0, 0.4);
             }
             for i in 0..self.rows() {
                 let idx = self.scroll + i;
                 let Some(e) = items.get(idx) else { break };
-                let y = 56.0 + 40.0 * i as f32;
+                let y = 56.0 + ROW_PITCH * i as f32;
                 let hot = self.hover == Hover::Row(idx);
                 let flashing = matches!(self.flash, Some((fi, _)) if fi == idx);
-                c.rrect(24.0, y, cw, 36.0, 10.0, if flashing { 0.16 } else if hot { 0.11 } else { 0.04 });
+                let lifted = idx == self.row_i && alpha >= 1.0 && (self.row_t > 0.0 || self.press_t > 0.0);
+                if lifted {
+                    let e = |t: f32| t * t * (3.0 - 2.0 * t);
+                    let z = 1.0 - (1.0 - PRESS) * e(self.press_t);
+                    let (cx, cy) = (ox + PAD + cw / 2.0, oy + y + ROW_H / 2.0);
+                    rt.SetTransform(&Matrix3x2 { M11: z, M12: 0.0, M21: 0.0, M22: z, M31: cx * (1.0 - z), M32: cy * (1.0 - z) - LIFT * e(self.row_t) });
+                }
+                c.rrect(PAD, y, cw, ROW_H, 16.0, if flashing { 0.18 } else if hot { 0.14 } else { 0.06 });
                 if hot {
-                    c.rrect(24.0, y + 9.0, 3.0, 18.0, 1.5, 0.9);
+                    c.rrect(PAD, y + 12.0, 3.0, 18.0, 1.5, 0.9);
                 }
                 let glyph = if flashing { "\u{E73E}" } else if e.files { "\u{E8A5}" } else { "\u{E8C8}" };
-                c.rrect(34.0, y + 4.0, 28.0, 28.0, 8.0, if flashing { 0.22 } else { 0.09 });
+                c.rrect(PAD + 10.0, y + 6.0, 30.0, 30.0, 12.0, if flashing { 0.22 } else { 0.09 });
                 match (&icons[i], flashing) {
                     (Some(bmp), false) => {
-                        let d = rect(ox + 36.0, oy + y + 6.0, 24.0, 24.0);
+                        let d = rect(ox + PAD + 13.0, oy + y + 9.0, 24.0, 24.0);
                         rt.DrawBitmap(bmp, Some(&d), alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                     }
-                    _ => c.text(glyph, &fo.icon, 34.0, y + 4.0, 28.0, 28.0, if flashing { 1.0 } else { 0.7 }),
+                    _ => c.text(glyph, &fo.icon, PAD + 10.0, y + 6.0, 30.0, 30.0, if flashing { 1.0 } else { 0.7 }),
                 }
-                c.text(&row_label(e), &fo.body, 74.0, y, cw - 50.0 - 52.0, 36.0, 1.0);
+                let sz = if e.files { size_label(e) } else { String::new() };
+                let lw = if sz.is_empty() { cw - 50.0 - 52.0 } else { cw - 50.0 - 52.0 - 64.0 };
+                c.text(&row_label(e), &fo.body, PAD + 50.0, y, lw, ROW_H, 1.0);
+                if !sz.is_empty() {
+                    let x = if hot && !flashing { cw - 98.0 - 64.0 } else { cw - 48.0 - 64.0 };
+                    c.text(&sz, &fo.small_r, PAD + x, y, 60.0, ROW_H, 0.45);
+                }
                 if hot && !flashing {
-                    c.text("Click to copy", &fo.small_r, 24.0 + cw - 98.0, y, 90.0, 36.0, 0.55);
+                    c.text("Click to copy", &fo.small_r, PAD + cw - 98.0, y, 90.0, ROW_H, 0.55);
                 } else {
-                    c.text(&age(e.t), &fo.small_r, 24.0 + cw - 48.0, y, 40.0, 36.0, 0.45);
+                    c.text(&age(e.t), &fo.small_r, PAD + cw - 48.0, y, 40.0, ROW_H, 0.45);
+                }
+                if lifted {
+                    rt.SetTransform(&Matrix3x2::identity());
                 }
             }
             return Ok(());
@@ -1036,9 +1159,9 @@ impl Island {
         // Media tab: every playing session gets an equal player, the rest are small tiles.
         if sessions.is_empty() {
             self.anim.clear();
-            c.text("\u{E8D6}", &fo.icon_big, 24.0, 90.0, bw - 48.0, 36.0, 0.3);
-            c.text("Nothing playing", &fo.center, 24.0, 130.0, bw - 48.0, 24.0, 0.7);
-            c.text("Play music or video in any app or browser", &fo.center, 24.0, 156.0, bw - 48.0, 18.0, 0.4);
+            c.text("\u{E8D6}", &fo.icon_big, PAD, 90.0, bw - 2.0 * PAD, 36.0, 0.3);
+            c.text("Nothing playing", &fo.center, PAD, 130.0, bw - 2.0 * PAD, 24.0, 0.7);
+            c.text("Play music or video in any app or browser", &fo.center, PAD, 156.0, bw - 2.0 * PAD, 18.0, 0.4);
             return Ok(());
         }
         let now = Instant::now();
@@ -1135,17 +1258,15 @@ impl Island {
         }
         c.text(&clock(shown), &fo.small, l.tx, l.sy + 10.0, 60.0, 16.0, 0.55);
         c.text(&clock(dur), &fo.small_r, l.tx + l.tw - 60.0, l.sy + 10.0, 60.0, 16.0, 0.55);
-        let mid = if p.playing { "\u{E769}" } else { "\u{E768}" };
-        for (x, glyph, h, big) in [(l.cxs[0], "\u{E892}", Hover::Prev(i), false), (l.cxs[1], mid, Hover::Play(i), true), (l.cxs[2], "\u{E893}", Hover::Next(i), false)] {
+        for (x, kind, h) in [(l.cxs[0], 2, Hover::Prev(i)), (l.cxs[1], if p.playing { 1 } else { 0 }, Hover::Play(i)), (l.cxs[2], 3, Hover::Next(i))] {
             let hot = self.hover == h;
-            if big {
-                c.circle(x, l.cy, 24.0, if hot { 1.0 } else { 0.9 });
-                c.ink(glyph, &fo.icon_big, x - 22.0, l.cy - 22.0, 44.0, 44.0, 1.0);
+            if kind < 2 {
+                let b = if hot { BTN + 4.0 } else { BTN + 2.0 };
+                c.rrect(x - b / 2.0, l.cy - b / 2.0, b, b, BTN_R + 1.0, if hot { 1.0 } else { 0.94 });
+                c.icon(kind, x, l.cy, 11.0, true, 1.0);
             } else {
-                if hot {
-                    c.circle(x, l.cy, 20.0, 0.16);
-                }
-                c.text(glyph, &fo.icon, x - 22.0, l.cy - 22.0, 44.0, 44.0, if hot { 1.0 } else { 0.8 });
+                c.rrect(x - BTN / 2.0, l.cy - BTN / 2.0, BTN, BTN, BTN_R, if hot { 0.2 } else { 0.08 });
+                c.icon(kind, x, l.cy, 9.0, false, if hot { 1.0 } else { 0.85 });
             }
         }
     }
@@ -1154,7 +1275,7 @@ impl Island {
     unsafe fn tile_card(&self, c: &Ctx, fo: &Fonts, s: &media::Media, i: usize) {
         let (x, y, w, h) = self.tile(i);
         let hot = self.hover == Hover::Sec(i);
-        let glyph = if s.playing { "\u{E769}" } else { "\u{E768}" };
+        let kind = if s.playing { 1 } else { 0 };
         let status = format!("{} \u{B7} {}", media::app_name(&s.id), if s.playing { "Playing" } else { "Paused" });
         c.rrect(x, y, w, h, 16.0, if hot { 0.12 } else { 0.06 });
         let frac = if s.dur > 0.0 { (s.position() / s.dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
@@ -1171,8 +1292,8 @@ impl Island {
                 c.rrect(x + 14.0, py - 1.5, bw, 3.0, 1.5, 0.16);
                 c.rrect(x + 14.0, py - 1.5, bw * frac, 3.0, 1.5, 0.8);
             }
-            c.circle(px, py, 18.0, if hot { 1.0 } else { 0.85 });
-            c.ink(glyph, &fo.icon, px - 18.0, py - 18.0, 36.0, 36.0, 1.0);
+            c.rrect(px - 18.0, py - 18.0, 36.0, 36.0, BTN_R, if hot { 1.0 } else { 0.85 });
+            c.icon(kind, px, py, 8.0, true, 1.0);
         } else {
             c.rrect(x + 12.0, y + 12.0, 48.0, 48.0, 12.0, 0.1);
             c.text("\u{E8D6}", &fo.icon_big, x + 12.0, y + 12.0, 48.0, 48.0, 0.75);
@@ -1184,8 +1305,8 @@ impl Island {
                 c.rrect(x + 16.0, y + h - 6.0, (w - 32.0) * frac, 2.0, 1.0, 0.5);
             }
             let (px, py) = (x + w - 32.0, y + h / 2.0);
-            c.circle(px, py, 18.0, if hot { 1.0 } else { 0.85 });
-            c.ink(glyph, &fo.icon, px - 18.0, py - 18.0, 36.0, 36.0, 1.0);
+            c.rrect(px - 18.0, py - 18.0, 36.0, 36.0, BTN_R, if hot { 1.0 } else { 0.85 });
+            c.icon(kind, px, py, 8.0, true, 1.0);
         }
     }
 
@@ -1209,12 +1330,12 @@ impl Island {
             }
         }
         if self.tab == Tab::Clip {
-            if (bw - 90.0..bw - 24.0).contains(&x) && (16.0..40.0).contains(&y) {
+            if (bw - 90.0..bw - PAD).contains(&x) && (16.0..40.0).contains(&y) {
                 return Hover::Clear;
             }
-            if (24.0..bw - 24.0).contains(&x) && y >= 56.0 {
-                let i = ((y - 56.0) / 40.0) as usize;
-                if i < self.rows() && (y - 56.0) - 40.0 * i as f32 <= 36.0 && self.scroll + i < self.store.items.len() {
+            if (PAD..bw - PAD).contains(&x) && y >= 56.0 {
+                let i = ((y - 56.0) / ROW_PITCH) as usize;
+                if i < self.rows() && (y - 56.0) - ROW_PITCH * i as f32 <= ROW_H && self.scroll + i < self.store.items.len() {
                     return Hover::Row(self.scroll + i);
                 }
             }
@@ -1230,7 +1351,7 @@ impl Island {
                 return Hover::Scrub(i);
             }
             for (cx, h) in [(l.cxs[0], Hover::Prev(i)), (l.cxs[1], Hover::Play(i)), (l.cxs[2], Hover::Next(i))] {
-                if (x - cx).hypot(y - l.cy) <= 22.0 {
+                if (x - cx).abs() <= BTN / 2.0 + 2.0 && (y - l.cy).abs() <= BTN / 2.0 + 2.0 {
                     return h;
                 }
             }
@@ -1315,6 +1436,7 @@ impl Island {
                                 } else if clip::write(self.hwnd, &e) {
                                     self.own_seq = GetClipboardSequenceNumber();
                                     self.flash = Some((i, Instant::now()));
+                                    if self.cfg.paste_on_click { send_paste(); }
                                 }
                             }
                             self.hover = Hover::None;
@@ -1397,6 +1519,7 @@ impl Island {
                             if clip::write(self.hwnd, &e) {
                                 self.own_seq = GetClipboardSequenceNumber();
                                 self.flash = Some((i, Instant::now()));
+                                if self.cfg.paste_on_click { send_paste(); }
                             }
                         }
                         self.touch();

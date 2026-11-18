@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
@@ -46,14 +46,14 @@ dependencies = [
 
 [[package]]
 name = "lumen-setup"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "lumen-tap"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "windows",
  "windows-core",
