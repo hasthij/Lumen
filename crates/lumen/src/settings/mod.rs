@@ -105,6 +105,7 @@ enum Hit {
     Keyword(String),
     ReloadSkin,
     OpenLog,
+    CheckUpdate,
     OpenConfig,
     OpenSkins,
     WebFallback,
@@ -643,6 +644,7 @@ impl Settings {
                     SetTimer(self.hwnd, TIMER_NOTICE, 2500, None);
                 }
             }
+            Hit::CheckUpdate => crate::app::check_updates(true),
             Hit::OpenLog => open(&crate::log::dir().display().to_string()),
             Hit::OpenConfig => open(&crate::config::path().display().to_string()),
             Hit::OpenSkins => {
@@ -950,7 +952,7 @@ impl Settings {
             self.regions.push((r, Hit::Nav(*page)));
         }
 
-        let foot = format!("Using {:.1} MB", self.status.memory_mb);
+        let foot = format!("v{} \u{B7} {:.1} MB", env!("CARGO_PKG_VERSION"), self.status.memory_mb);
         self.canvas.text(&foot, Rect::new(24.0, H - 44.0, SIDEBAR - 40.0, 24.0), Font::Text, 11.5, 400, white(0.45), Align::Left);
 
         let (title, subtitle) = match self.page {
@@ -1620,7 +1622,8 @@ impl Settings {
     fn page_about(&mut self, mut y: f32) -> f32 {
         y = self.section("Lumen", y);
         let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
-        self.card(y, 68.0, Some(('\u{E946}', None)), "Lumen", &version);
+        let r = self.card(y, 68.0, Some(('\u{E946}', None)), "Lumen", &version);
+        self.button(r.x + r.w - 16.0, r.y + r.h / 2.0, "Check for updates", Hit::CheckUpdate);
         y += 72.0;
         let apps = format!("{} apps indexed for the launcher", self.status.apps);
         self.card(y, 68.0, Some(('\u{E71D}', None)), "App index", &apps);

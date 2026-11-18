@@ -19,6 +19,7 @@ mod rainmeter;
 mod settings;
 mod taskbar;
 mod theme;
+mod update;
 
 use windows::core::w;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};

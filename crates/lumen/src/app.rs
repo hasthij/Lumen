@@ -33,6 +33,38 @@ pub const WM_RESTORE_TASKBAR: u32 = WM_APP + 5;
 const WM_FOREGROUND: u32 = WM_APP + 6;
 static APP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// Ask GitHub for a newer release; `manual` also reports "up to date" and errors.
+pub fn check_updates(manual: bool) {
+    let h = APP_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    if h != 0 {
+        crate::update::check(HWND(h as *mut _), manual);
+    }
+}
+
+/// Result of an update check: offer the install, or say there is nothing new (manual only).
+unsafe fn on_update_result(hwnd: HWND, manual: bool) {
+    let found = crate::update::FOUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(r) = found else {
+        if manual {
+            MessageBoxW(hwnd, &HSTRING::from(format!("Lumen {} is the latest version.", env!("CARGO_PKG_VERSION"))), w!("Lumen"), MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    };
+    let msg = format!("Lumen {} is available (you have {}).\n\nDownload and install it now?", r.version, env!("CARGO_PKG_VERSION"));
+    if MessageBoxW(hwnd, &HSTRING::from(msg), w!("Lumen update"), MB_YESNO | MB_ICONINFORMATION) != IDYES {
+        return;
+    }
+    match crate::update::download(&r) {
+        Some(setup) => {
+            let _ = std::process::Command::new(setup).arg("/S").spawn();
+            PostQuitMessage(0);
+        }
+        None => {
+            MessageBoxW(hwnd, w!("Download failed. Check your connection and try again."), w!("Lumen"), MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
 unsafe extern "system" fn on_foreground(_: windows::Win32::UI::Accessibility::HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
     let app = APP_HWND.load(std::sync::atomic::Ordering::Relaxed);
     if app != 0 {
@@ -122,6 +154,7 @@ pub fn run(open_settings: bool) -> Result<()> {
             app.open_settings();
         }
     });
+    check_updates(false);
 
     let mut msg = MSG::default();
     unsafe {
@@ -614,6 +647,10 @@ impl App {
             }
             WM_OPEN_SETTINGS => {
                 self.open_settings();
+                Some(LRESULT(0))
+            }
+            crate::update::WM_UPDATE => {
+                unsafe { on_update_result(self.hwnd, wp.0 != 0) };
                 Some(LRESULT(0))
             }
             WM_OPEN_LAUNCHER => {

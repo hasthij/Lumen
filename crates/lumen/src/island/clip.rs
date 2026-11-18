@@ -10,7 +10,7 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Com::{CoTaskMemFree, IDataObject, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
-use windows::Win32::System::Ole::{DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+use windows::Win32::System::Ole::{DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{DragQueryFileW, SHCreateDataObject, SHParseDisplayName, DROPFILES, HDROP};
@@ -308,6 +308,24 @@ unsafe fn text_data(e: &Entry) -> Option<IDataObject> {
     if data.SetData(&fmt, &medium, true).is_err() {
         let _ = GlobalFree(mem);
         return None;
+    }
+    // Many drop targets (older editors, terminals) only ask for ANSI text; offer it for ASCII.
+    if e.s.is_ascii() {
+        let bytes: Vec<u8> = e.s.bytes().chain(std::iter::once(0)).collect();
+        if let Ok(m) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) {
+            let p = GlobalLock(m) as *mut u8;
+            if p.is_null() {
+                let _ = GlobalFree(m);
+            } else {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                let _ = GlobalUnlock(m);
+                let f = FORMATETC { cfFormat: CF_TEXT.0, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+                let med = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: m }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
+                if data.SetData(&f, &med, true).is_err() {
+                    let _ = GlobalFree(m);
+                }
+            }
+        }
     }
     Some(data)
 }
