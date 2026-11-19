@@ -16,6 +16,8 @@ const NO_WINDOW: u32 = 0x0800_0000;
 pub struct Release {
     pub version: String,
     pub url: String,
+    /// Release notes contain `[important]`: nag with PLEASE UPDATE.
+    pub important: bool,
 }
 
 /// The newest release found by the last check, if it is newer than this build.
@@ -48,7 +50,7 @@ fn latest() -> Option<Release> {
 fn parse(json: &str) -> Option<Release> {
     let version = field(json, "tag_name")?.trim_start_matches('v').to_string();
     let url = json.split("\"browser_download_url\"").skip(1).filter_map(|s| s.split('"').nth(1)).find(|u| u.ends_with("LumenSetup.exe"))?.to_string();
-    Some(Release { version, url })
+    Some(Release { version, url, important: json.contains("[important]") })
 }
 
 fn field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
@@ -76,6 +78,7 @@ mod tests {
     fn parses_release() {
         let j = r#"{"tag_name": "v0.3.0","assets":[{"browser_download_url": "https://x/a.zip"},{"browser_download_url": "https://x/LumenSetup.exe"}]}"#;
         let r = parse(j).unwrap();
-        assert_eq!((r.version.as_str(), r.url.as_str()), ("0.3.0", "https://x/LumenSetup.exe"));
+        assert_eq!((r.version.as_str(), r.url.as_str(), r.important), ("0.3.0", "https://x/LumenSetup.exe", false));
+        assert!(parse(&j.replace("\"assets\"", "\"body\": \"[important] fixes\", \"assets\"")).unwrap().important);
     }
 }

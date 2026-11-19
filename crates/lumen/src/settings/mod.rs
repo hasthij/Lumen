@@ -121,7 +121,6 @@ enum Hit {
     IslandSide(&'static str),
     IslandAnim(&'static str),
     IslandBg(u32),
-    IslandOutline,
     IslandNudge,
     IslandPaste,
     IslandFeat(&'static str),
@@ -129,6 +128,7 @@ enum Hit {
     IslandTint(&'static str),
     IslandFont(&'static str),
     IslandTabs(&'static str),
+    IslandTabIcons,
     IslandGrain,
     IslandSheen,
     Engine(&'static str),
@@ -565,10 +565,6 @@ impl Settings {
                 *b = !*b;
                 self.commit_config();
             }
-            Hit::IslandOutline => {
-                self.cfg.island.outline = !self.cfg.island.outline;
-                self.commit_config();
-            }
             Hit::IslandPreset(p) => {
                 if p == "custom" {
                     self.cfg.island.theme = "custom".into(); // keep the current knobs
@@ -587,6 +583,10 @@ impl Settings {
                     _ => c.sheen = !c.sheen,
                 }
                 c.theme = "custom".into();
+                self.commit_config();
+            }
+            Hit::IslandTabIcons => {
+                self.cfg.island.tab_icons = !self.cfg.island.tab_icons;
                 self.commit_config();
             }
             Hit::Animation(id) => {
@@ -1024,7 +1024,11 @@ impl Settings {
         let c = &mut self.canvas;
         c.fill(Rect::new(24.0, 26.0, 28.0, 28.0), 7.0, rgba(0.0, 0.0, 0.0, 1.0));
         c.stroke(Rect::new(24.0, 26.0, 28.0, 28.0), 7.0, 1.0, white(0.18));
-        c.circle(38.0, 40.0, 5.5, white(1.0));
+        // Beam L mark (same 64-unit geometry as icon.rs and the island orb).
+        let k = 28.0 / 64.0;
+        c.fill(Rect::new(24.0 + 15.0 * k, 26.0 + 10.0 * k, 9.5 * k, 44.0 * k), 4.75 * k, white(1.0));
+        c.fill(Rect::new(24.0 + 15.0 * k, 26.0 + 44.5 * k, 34.0 * k, 9.5 * k), 4.75 * k, white(1.0));
+        c.circle(24.0 + 44.0 * k, 26.0 + 21.0 * k, 5.25 * k, white(1.0));
         c.text("Lumen", Rect::new(62.0, 26.0, 150.0, 28.0), Font::Display, 15.0, 600, white(0.95), Align::Left);
 
         let accent = self.accent();
@@ -1568,20 +1572,23 @@ impl Settings {
         };
         y = pick(self, y, '\u{E790}', "Theme", "A preset for every knob below; changing a knob makes it Custom",
             &[("smoke", "Smoke"), ("ink", "Ink"), ("frost", "Frost"), ("liquid", "Liquid"), ("aura", "Aura"), ("custom", "Custom")], &isl.theme, Hit::IslandPreset);
-        y = pick(self, y, '\u{E771}', "Tint", "Colour laid over the blurred glass",
+        y = pick(self, y, '\u{E771}', "Tint colour", "Colour washed over the glass; text flips dark or light to stay readable",
             &[("dark", "Dark"), ("light", "Light"), ("accent", "Accent"), ("clear", "Clear")], &isl.tint, Hit::IslandTint);
         let fonts: Vec<(&'static str, &str)> = crate::config::ISLAND_FONTS.iter().map(|f| (*f, *f)).collect();
         y = pick(self, y, '\u{E8D2}', "Font", "Falls back to Segoe UI if not installed", &fonts, &isl.font, Hit::IslandFont);
         y = pick(self, y, '\u{E8A9}', "Tabs", "How the tab bar looks",
             &[("pills", "Pills"), ("segmented", "Segmented"), ("underline", "Underline")], &isl.tab_style, Hit::IslandTabs);
+        self.card(y, 68.0, Some(('\u{E8B9}', None)), "Tab icons", "Show icons instead of words in the tab bar");
+        self.toggle(right, y + 34.0, isl.tab_icons, Hit::IslandTabIcons, true);
+        y += 72.0;
         let rows: [(char, &str, &str, Slider); 7] = [
-            ('\u{E793}', "Tint strength", "0% is clear glass, 100% is solid", Slider::IslandOpacity),
-            ('\u{E727}', "Blur", "Background blur; 0 turns the glass off", Slider::IslandBlur),
-            ('\u{E706}', "Saturation", "Colour boost of what shows through", Slider::IslandSat),
-            ('\u{E7B3}', "Edge", "Light rim around the island", Slider::IslandEdge),
+            ('\u{E793}', "Tint amount", "How much tint colour covers the glass: 0% none, 100% solid", Slider::IslandOpacity),
+            ('\u{E727}', "Frost", "How blurred the desktop behind looks; 0 turns the glass off", Slider::IslandBlur),
+            ('\u{E706}', "Vibrance", "How colourful the blurred desktop is: 100% as-is, higher is punchier", Slider::IslandSat),
+            ('\u{E7B3}', "Outline", "Thin light rim around the island; 0% hides it", Slider::IslandEdge),
             ('\u{E71A}', "Corner radius", "Roundness of the open panel", Slider::IslandRadius),
             ('\u{E8E9}', "Text size", "Base font size", Slider::IslandFontSize),
-            ('\u{E790}', "Accent hue", "Used by the Accent tint", Slider::IslandHue),
+            ('\u{E790}', "Accent hue", "Shade used when Tint colour is Accent", Slider::IslandHue),
         ];
         for (g, t, d, s) in rows {
             self.card(y, 68.0, Some((g, None)), t, d);
@@ -1599,7 +1606,7 @@ impl Settings {
         self.card(y, 68.0, Some(('\u{E706}', None)), "Sheen", "Soft light across the top");
         self.toggle(right, y + 34.0, self.cfg.island.sheen, Hit::IslandSheen, true);
         y += 72.0;
-        self.card(y, 108.0, Some(('\u{E771}', None)), "Background", "Colour of the Dark tint");
+        self.card(y, 108.0, Some(('\u{E771}', None)), "Dark colour", "Shade used when Tint colour is Dark");
         let current = theme::parse_hex(&self.cfg.island.bg).unwrap_or([0.0; 3]);
         let mut x = CONTENT_X + 74.0;
         let cy = y + 84.0;
@@ -1609,15 +1616,7 @@ impl Settings {
             self.swatch(x, cy, rgba(c[0], c[1], c[2], 1.0), selected, Hit::IslandBg(sw));
             x += 34.0;
         }
-        y += 112.0;
-        self.card(y, 68.0, Some(('\u{E793}', None)), "Opacity", "How see-through the island is");
-        let v = self.slider_label(Slider::IslandOpacity);
-        self.slider(RIGHT - 356.0, y + 34.0, 300.0, Slider::IslandOpacity, None);
-        self.canvas.text(&v, Rect::new(RIGHT - 48.0, y + 16.0, 48.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
-        y += 72.0;
-        self.card(y, 68.0, Some(('\u{E7B3}', None)), "Outline", "Thin light edge around the island");
-        self.toggle(right, y + 34.0, self.cfg.island.outline, Hit::IslandOutline, true);
-        y + 68.0
+        y + 108.0
     }
 
     fn page_launcher(&mut self, mut y: f32) -> f32 {

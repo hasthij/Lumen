@@ -224,6 +224,16 @@ impl Tab {
             Tab::Shelf => "Notes",
         }
     }
+    fn glyph(self) -> &'static str {
+        match self {
+            Tab::Clip => "\u{E77F}",
+            Tab::Media => "\u{E8D6}",
+            Tab::Sound => "\u{E767}",
+            Tab::Launch => "\u{ECAA}",
+            Tab::System => "\u{E9D9}",
+            Tab::Shelf => "\u{E70B}",
+        }
+    }
     fn width(self) -> f32 {
         match self {
             Tab::Clip => 46.0,
@@ -666,8 +676,12 @@ pub struct Island {
     fonts: Option<Fonts>,
     /// Blurred, saturated, downscaled monitor capture behind the open panel: (w, h, BGRA).
     snap: Option<(i32, i32, Vec<u8>)>,
+    /// Mean luminance (0..1) of the backdrop behind the window, from the last capture.
+    snap_lum: f32,
     snap_bmp: Option<ID2D1Bitmap>,
     noise_bmp: Option<ID2D1Bitmap>,
+    /// Backdrop + tint + grain baked at window size; per-frame fills are then a 1:1 copy.
+    glass: Option<([u32; 9], ID2D1Bitmap)>,
     /// Fractional wheel notches not yet applied, and an eased Sound slider: (target id, target, current).
     wheel: Option<(usize, f32, f32)>,
     wheel_hw: Instant,
@@ -784,8 +798,10 @@ impl Island {
                 surf: (0, 0),
                 fonts: None,
                 snap: None,
+                snap_lum: 0.2,
                 snap_bmp: None,
                 noise_bmp: None,
+                glass: None,
                 wheel: None,
                 wheel_hw: Instant::now(),
                 arts: Default::default(),
@@ -862,9 +878,7 @@ impl Island {
         if reshoot {
             self.snap = None;
             self.snap_bmp = None;
-            if self.mode == Mode::Open {
-                unsafe { self.capture() };
-            }
+            self.glass = None;
         }
         self.side = parse_side(&cfg.side);
         self.rgb = parse_rgb(&cfg.bg);
@@ -876,7 +890,15 @@ impl Island {
             self.filter = 0;
         }
         if self.shown {
+            let was = (self.org, self.px);
             unsafe { self.place() };
+            self.glass = None;
+            // Re-shoot only if place() moved/resized the window (snap_lum is measured there); a re-shoot while
+            // open would also grab our own panel, and per-slider-tick full-monitor blurs are costly.
+            if self.mode == Mode::Open && was != (self.org, self.px) {
+                self.snap_bmp = None;
+                unsafe { self.capture() };
+            }
             self.touch();
         }
     }
@@ -1089,8 +1111,16 @@ impl Island {
                 _ => true,
             };
             if on {
-                v.push((x, t.width(), t));
-                x += t.width() + TAB_GAP;
+                let w = if c.tab_icons { 38.0 } else { t.width() };
+                v.push((x, w, t));
+                x += w + TAB_GAP;
+            }
+        }
+        // Icon tabs are narrow: centre the row instead of hugging the left edge.
+        if c.tab_icons {
+            let shift = ((self.cb().0 - (x - TAB_GAP + PAD)) / 2.0).max(0.0);
+            for t in &mut v {
+                t.0 += shift;
             }
         }
         v
@@ -1310,6 +1340,7 @@ impl Island {
     unsafe fn release_surface(&mut self) {
         self.rt = None;
         self.snap_bmp = None;
+        self.glass = None;
         self.noise_bmp = None;
         self.arts.clear();
         self.fonts = None;
@@ -1409,6 +1440,12 @@ impl Island {
             let hw = c == t || self.wheel_hw.elapsed() >= Duration::from_millis(50);
             if hw { self.wheel_hw = now; }
             self.set_level(id, c, hw);
+            // Only the media-tab wheel drives the HUD; Sound-tab faders must not hijack it.
+            if let Some((bright, _, _)) = self.hud {
+                if if bright { id == usize::MAX - mixer::monitor_of(self.hwnd) } else { id == 0 } {
+                    self.hud = Some((bright, c, now));
+                }
+            }
             self.dirty = true;
         }
         let mut flashing = false;
@@ -1428,7 +1465,7 @@ impl Island {
                 self.dirty = true;
             }
         }
-        if self.mode == Mode::Open && now.duration_since(self.last_draw) >= Duration::from_millis(400) {
+        if self.mode == Mode::Open && now.duration_since(self.last_draw) >= Duration::from_millis(1000) {
             if let Some(wk) = &self.worker {
                 if wk.state.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|x| x.playing) {
                     self.dirty = true;
@@ -1511,7 +1548,10 @@ impl Island {
             }
             Mode::Peek => {
                 let on = inside(self.screen_rect(PEEK_EXT, PEEK_HH, 8));
-                if (on && depth >= 2) || (at_edge && now.duration_since(self.peek_since) >= Duration::from_millis(30)) {
+                // Dragging a window (title bar) to the edge must not open it; file drags still can.
+                let mut gti = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+                let moving_win = GetGUIThreadInfo(0, &mut gti).is_ok() && gti.flags.0 & GUI_INMOVESIZE.0 != 0;
+                if !moving_win && ((on && depth >= 2) || (at_edge && now.duration_since(self.peek_since) >= Duration::from_millis(30))) {
                     self.set_mode(Mode::Open);
                 } else if !on && !at_edge && !near && self.nudge_until.is_some_and(|t| now < t) {
                     self.off_since = None;
@@ -1549,6 +1589,7 @@ impl Island {
         }
         self.rt = None;
         self.snap_bmp = None;
+        self.glass = None;
         self.noise_bmp = None;
         self.arts.clear();
         if !self.has_bmp || self.surf != self.px {
@@ -1597,11 +1638,14 @@ impl Island {
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
         rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        // Media card easing re-arms this each frame it draws; anything else must not keep the vsync loop alive.
+        self.animating = false;
         let drawn = self.draw(&rt);
         let ended = rt.EndDraw(None, None);
         if drawn.is_err() || ended.is_err() {
             self.rt = None;
             self.snap_bmp = None;
+        self.glass = None;
             self.noise_bmp = None;
             self.arts.clear();
             self.icons.clear();
@@ -1690,6 +1734,7 @@ impl Island {
     unsafe fn capture(&mut self) {
         self.snap = None;
         self.snap_bmp = None;
+        self.glass = None;
         if self.cfg.blur == 0 {
             return;
         }
@@ -1722,6 +1767,7 @@ impl Island {
                 let _ = GdiFlush();
                 let mut px = std::slice::from_raw_parts(bits as *const u8, (sw * sh * 4) as usize).to_vec();
                 blur_sat(&mut px, sw as usize, sh as usize, self.cfg.saturation as f32 / 100.0);
+                self.snap_lum = backdrop_lum(&px, sw, sh, d, (self.org.0 - self.mon.left, self.org.1 - self.mon.top), self.px);
                 self.snap = Some((sw, sh, px));
             }
             SelectObject(mem, old);
@@ -1790,6 +1836,38 @@ impl Island {
         Ok(Some(rt.CreateBitmapBrush(self.noise_bmp.as_ref(), Some(&bp), Some(&brp))?))
     }
 
+    /// The baked glass as a brush (None without a backdrop). Rebuilt only when its inputs change.
+    unsafe fn glass(&mut self, rt: &ID2D1DCRenderTarget, t: (f32, f32, f32, f32)) -> Result<Option<ID2D1BitmapBrush>> {
+        if self.snap.is_none() {
+            return Ok(None);
+        }
+        let key = [self.px.0 as u32, self.px.1 as u32, self.org.0 as u32, self.org.1 as u32, t.0.to_bits(), t.1.to_bits(), t.2.to_bits(), t.3.to_bits(), self.cfg.grain as u32];
+        if self.glass.as_ref().map_or(true, |(k, _)| *k != key) {
+            let Some(sb) = self.snap_brush(rt)? else { return Ok(None) };
+            let (w, h) = (self.px.0 as f32 / self.s, self.px.1 as f32 / self.s);
+            let brt = rt.CreateCompatibleRenderTarget(
+                Some(&D2D_SIZE_F { width: w, height: h }),
+                Some(&D2D_SIZE_U { width: self.px.0 as u32, height: self.px.1 as u32 }),
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )?;
+            let all = rect(0.0, 0.0, w, h);
+            brt.BeginDraw();
+            brt.FillRectangle(&all, &sb);
+            let tb = brt.CreateSolidColorBrush(&color(t.0, t.1, t.2, t.3), None)?;
+            brt.FillRectangle(&all, &tb);
+            if self.cfg.grain {
+                if let Some(nb) = self.noise(rt)? {
+                    brt.FillRectangle(&all, &nb);
+                }
+            }
+            brt.EndDraw(None, None)?;
+            self.glass = Some((key, brt.GetBitmap()?));
+        }
+        let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
+        Ok(Some(rt.CreateBitmapBrush(self.glass.as_ref().map(|(_, b)| b), Some(&bp), None)?))
+    }
+
     unsafe fn draw(&mut self, rt: &ID2D1DCRenderTarget) -> Result<()> {
         let (ext, hh, k) = self.shape();
         if ext < 0.5 {
@@ -1806,15 +1884,16 @@ impl Island {
         }
         let geo = self.geometry(ext, hh, k)?;
         let (r, g, b, ta) = self.tint();
-        let snap = self.snap_brush(rt)?;
-        if let Some(sb) = &snap {
-            sb.SetOpacity(panel);
-            rt.FillGeometry(&geo, sb, None::<&ID2D1Brush>);
+        let glass = self.glass(rt, (r, g, b, ta))?;
+        if let Some(gb) = &glass {
+            gb.SetOpacity(panel);
+            rt.FillGeometry(&geo, gb, None::<&ID2D1Brush>);
+        } else {
+            // Without a backdrop a see-through tint would show the desktop sharp; keep it readable.
+            let ta = if self.cfg.blur > 0 { ta.max(0.85) } else { ta };
+            br.SetColor(&color(r, g, b, ta * panel));
+            rt.FillGeometry(&geo, &br, None::<&ID2D1Brush>);
         }
-        // Without a backdrop a see-through tint would show the desktop sharp; keep it readable.
-        let ta = if snap.is_none() && self.cfg.blur > 0 { ta.max(0.85) } else { ta };
-        br.SetColor(&color(r, g, b, ta * panel));
-        rt.FillGeometry(&geo, &br, None::<&ID2D1Brush>);
         let (l, t, rr, bb) = self.bounds(ext, hh);
         if self.cfg.sheen {
             let stops = [
@@ -1829,7 +1908,7 @@ impl Island {
             )?;
             rt.FillGeometry(&geo, &lb, None::<&ID2D1Brush>);
         }
-        if self.cfg.grain {
+        if self.cfg.grain && glass.is_none() {
             if let Some(nb) = self.noise(rt)? {
                 nb.SetOpacity(panel);
                 rt.FillGeometry(&geo, &nb, None::<&ID2D1Brush>);
@@ -1839,7 +1918,10 @@ impl Island {
             br.SetColor(&color(1.0, 1.0, 1.0, self.cfg.edge * panel));
             rt.DrawGeometry(&geo, &br, 1.0 / self.s, None);
         }
-        let light = self.cfg.tint != "clear" && 0.299 * r + 0.587 * g + 0.114 * b > 0.6;
+        // Pick text colour from what the eye sees: the tint laid over the blurred backdrop.
+        let tl = 0.299 * r + 0.587 * g + 0.114 * b;
+        let lum = if glass.is_some() { tl * ta + self.snap_lum * (1.0 - ta) } else if self.cfg.tint == "clear" { 0.0 } else { tl };
+        let light = lum > 0.58;
         let fg = if light { (0.06, 0.06, 0.07) } else { (1.0, 1.0, 1.0) };
         let a = ((k - 0.45) / 0.45).clamp(0.0, 1.0);
         let alpha = a * a * (3.0 - 2.0 * a);
@@ -1904,17 +1986,39 @@ impl Island {
         let (bw, _) = self.cb();
 
         // Tab bar.
-        for (x, w, tab) in self.tabs() {
-            let label = tab.label();
-            let on = self.tab == tab;
-            if on {
-                c.rrect(x, 14.0, w, 28.0, TAB_R, 0.16);
-            } else if self.hover == Hover::Tab(tab) {
-                c.rrect(x, 14.0, w, 28.0, TAB_R, 0.08);
+        let tabs = self.tabs();
+        let style = self.cfg.tab_style.as_str();
+        if style == "segmented" {
+            if let (Some(f), Some(l)) = (tabs.first(), tabs.last()) {
+                c.rrect(f.0 - 3.0, 11.0, l.0 + l.1 - f.0 + 6.0, 34.0, 10.0, 0.07);
             }
-            c.text(label, &fo.center, x, 14.0, w, 28.0, if on { 1.0 } else { 0.55 });
+        }
+        for &(x, w, tab) in &tabs {
+            let on = self.tab == tab;
+            let hot = self.hover == Hover::Tab(tab);
+            let r = match style {
+                "underline" => {
+                    if on || hot {
+                        c.rrect(x + 8.0, 40.0, w - 16.0, 2.0, 1.0, if on { 0.9 } else { 0.3 });
+                    }
+                    None
+                }
+                "segmented" => Some(7.0),
+                _ => Some(TAB_R),
+            };
+            if let Some(r) = r {
+                if on || hot {
+                    c.rrect(x, 14.0, w, 28.0, r, if on { 0.16 } else { 0.08 });
+                }
+            }
+            let a = if on { 1.0 } else if hot { 0.8 } else { 0.55 };
+            if self.cfg.tab_icons {
+                c.text(tab.glyph(), &fo.icon, x, 14.0, w, 28.0, a);
+            } else {
+                c.text(tab.label(), &fo.center, x, 14.0, w, 28.0, a);
+            }
             if tab == Tab::Media && sessions.iter().any(|s| s.playing) {
-                c.circle(x + w - 9.0, 21.0, 3.0, 0.9);
+                if self.cfg.tab_icons { c.circle(x + w - 5.0, 18.0, 2.5, 0.9) } else { c.circle(x + w - 9.0, 21.0, 3.0, 0.9) }
             }
         }
         // Thin divider under the header.
@@ -3123,11 +3227,25 @@ impl Island {
                     // Precision touchpads send deltas under 120; still move one step.
                     let notches = if delta.abs() >= 120 { delta / 120 } else { delta.signum() };
                     if self.tab == Tab::Media && self.cfg.media_controls {
-                        let bright = wp.0 & 0x4 != 0; // MK_SHIFT: brightness, plain wheel: volume
-                        let d = notches as f32 * 0.04;
-                        let lv = if bright { media::brightness(self.hwnd, d * 2.5) } else { media::volume(d) };
-                        if let Some(v) = lv {
-                            self.hud = Some((bright, v, Instant::now()));
+                        // MK_SHIFT: brightness, plain wheel: volume; both eased like the Sound faders.
+                        let bright = wp.0 & 0x4 != 0;
+                        let id = if bright { usize::MAX - mixer::monitor_of(self.hwnd) } else { 0 };
+                        let live = matches!(self.wheel, Some((w, _, _)) if w == id);
+                        if !live {
+                            // Levels are only sampled on the Sound tab; read the device fresh.
+                            if bright {
+                                let i = usize::MAX - id;
+                                if self.bri.len() <= i { self.bri.resize(i + 1, None); }
+                                self.bri[i] = mixer::brightness(i, None);
+                            } else if let Some(m) = mixer::master() {
+                                self.master = m;
+                            }
+                        }
+                        if let Some(cur) = self.level_of(id) {
+                            let (base, c) = match self.wheel { Some((w, t, c)) if w == id => (t, c), _ => (cur, cur) };
+                            let t = (base + notches as f32 * if bright { 0.1 } else { 0.04 }).clamp(0.0, 1.0);
+                            self.wheel = Some((id, t, c));
+                            self.hud = Some((bright, c, Instant::now()));
                             self.touch();
                         }
                     }
@@ -3345,4 +3463,21 @@ unsafe fn pick_dialog(shelf: bool, owner: HWND) -> Vec<String> {
         }
     }
     paths
+}
+
+/// Mean luminance of the BGRA capture (`d` screen px per capture px) over the window rect at `org` (monitor px).
+fn backdrop_lum(px: &[u8], sw: i32, sh: i32, d: f32, org: (i32, i32), size: (i32, i32)) -> f32 {
+    let x0 = ((org.0 as f32 / d) as i32).clamp(0, sw - 1);
+    let y0 = ((org.1 as f32 / d) as i32).clamp(0, sh - 1);
+    let x1 = (((org.0 + size.0) as f32 / d).ceil() as i32).clamp(x0 + 1, sw);
+    let y1 = (((org.1 + size.1) as f32 / d).ceil() as i32).clamp(y0 + 1, sh);
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y * sw + x) * 4) as usize;
+            sum += 0.114 * px[i] as f32 + 0.587 * px[i + 1] as f32 + 0.299 * px[i + 2] as f32;
+            n += 1;
+        }
+    }
+    sum / n.max(1) as f32 / 255.0
 }

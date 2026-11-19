@@ -50,8 +50,12 @@ unsafe fn on_update_result(hwnd: HWND, manual: bool) {
         }
         return;
     };
-    let msg = format!("Lumen {} is available (you have {}).\n\nDownload and install it now?", r.version, env!("CARGO_PKG_VERSION"));
-    if MessageBoxW(hwnd, &HSTRING::from(msg), w!("Lumen update"), MB_YESNO | MB_ICONINFORMATION) != IDYES {
+    let (msg, title, icon) = if r.important {
+        (format!("IMPORTANT UPDATE: Lumen {} fixes serious issues.\nPLEASE UPDATE now (you have {}).\n\nDownload and install it now?", r.version, env!("CARGO_PKG_VERSION")), w!("Lumen - PLEASE UPDATE"), MB_ICONWARNING)
+    } else {
+        (format!("Lumen {} is available (you have {}).\n\nDownload and install it now?", r.version, env!("CARGO_PKG_VERSION")), w!("Lumen update"), MB_ICONINFORMATION)
+    };
+    if MessageBoxW(hwnd, &HSTRING::from(msg), title, MB_YESNO | icon) != IDYES {
         return;
     }
     match crate::update::download(&r) {

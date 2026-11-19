@@ -92,6 +92,8 @@ pub struct IslandConfig {
     pub font_size: f32,
     /// Tab bar look: "pills", "segmented" or "underline".
     pub tab_style: String,
+    /// Tab bar shows icons instead of words.
+    pub tab_icons: bool,
 }
 
 impl Default for IslandConfig {
@@ -126,6 +128,7 @@ impl Default for IslandConfig {
             font: String::new(),
             font_size: 13.0,
             tab_style: String::new(),
+            tab_icons: false,
         };
         c.apply_preset("smoke");
         c
