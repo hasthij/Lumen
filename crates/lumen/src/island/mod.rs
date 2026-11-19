@@ -165,8 +165,8 @@ const TOP_MAX_W: f32 = 640.0; // long titles grow the bar up to here, then ellip
 const SIDE_BOX: (f32, f32) = (360.0, 600.0);
 const F: f32 = 14.0; // fillet margin along the docked edge
 const PEEK: f32 = 0.28;
-const PEEK_EXT: f32 = 24.0;
-const PEEK_HH: f32 = 64.0;
+const PEEK_EXT: f32 = 42.0;
+const PEEK_HH: f32 = 21.0;
 // Tiles for other media sessions: side by side on the top edge, stacked on the sides.
 const MAX_TILES: usize = 3;
 const TILE_W: f32 = 200.0; // top dock
@@ -313,19 +313,21 @@ unsafe fn mk(dw: &IDWriteFactory, family: PCWSTR, size: f32, weight: i32, align:
 }
 
 impl Fonts {
-    unsafe fn new(dw: &IDWriteFactory) -> Result<Fonts> {
-        let ui = w!("Segoe UI");
+    unsafe fn new(dw: &IDWriteFactory, family: &str, size: f32) -> Result<Fonts> {
+        let fam = windows::core::HSTRING::from(family);
+        let ui = PCWSTR(fam.as_ptr());
+        let k = size / 13.0;
         let ic = w!("Segoe MDL2 Assets");
         let l = DWRITE_TEXT_ALIGNMENT_LEADING;
         let c = DWRITE_TEXT_ALIGNMENT_CENTER;
         Ok(Fonts {
-            title: mk(dw, ui, 15.0, 600, l)?,
-            body: mk(dw, ui, 13.0, 400, l)?,
-            small: mk(dw, ui, 11.0, 400, l)?,
-            small_r: mk(dw, ui, 11.0, 400, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
-            center: mk(dw, ui, 12.0, 400, c)?,
-            num: mk(dw, ui, 15.0, 600, c)?,
-            hdr: mk(dw, ui, 12.0, 600, l)?,
+            title: mk(dw, ui, 15.0 * k, 600, l)?,
+            body: mk(dw, ui, 13.0 * k, 400, l)?,
+            small: mk(dw, ui, 11.0 * k, 400, l)?,
+            small_r: mk(dw, ui, 11.0 * k, 400, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+            center: mk(dw, ui, 12.0 * k, 400, c)?,
+            num: mk(dw, ui, 15.0 * k, 600, c)?,
+            hdr: mk(dw, ui, 12.0 * k, 600, l)?,
             icon: mk(dw, ic, 15.0, 400, c)?,
             icon_big: mk(dw, ic, 22.0, 400, c)?,
         })
@@ -338,6 +340,57 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 
 fn rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
     D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+fn hsl(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (r + m, g + m, b + m)
+}
+
+/// Three box-blur passes (radius 2) each way, then saturation, on BGRA; output is opaque.
+fn blur_sat(px: &mut [u8], w: usize, h: usize, sat: f32) {
+    fn pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, horiz: bool) {
+        let (n, m) = if horiz { (h, w) } else { (w, h) };
+        for line in 0..n {
+            let at = |i: usize| if horiz { (line * w + i) * 4 } else { (i * w + line) * 4 };
+            for ch in 0..3 {
+                let mut acc: i32 = 0;
+                for j in -2i32..=2 {
+                    acc += src[at(j.clamp(0, m as i32 - 1) as usize) + ch] as i32;
+                }
+                for i in 0..m {
+                    dst[at(i) + ch] = (acc / 5) as u8;
+                    let add = src[at((i + 3).min(m - 1)) + ch] as i32;
+                    let sub = src[at(i.saturating_sub(2)) + ch] as i32;
+                    acc += add - sub;
+                }
+            }
+        }
+    }
+    let mut tmp = vec![0u8; px.len()];
+    for _ in 0..3 {
+        pass(px, &mut tmp, w, h, true);
+        pass(&tmp, px, w, h, false);
+    }
+    for p in px.chunks_mut(4) {
+        let (b, g, r) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        p[0] = (lum + (b - lum) * sat).clamp(0.0, 255.0) as u8;
+        p[1] = (lum + (g - lum) * sat).clamp(0.0, 255.0) as u8;
+        p[2] = (lum + (r - lum) * sat).clamp(0.0, 255.0) as u8;
+        p[3] = 255;
+    }
 }
 
 fn parse_rgb(s: &str) -> (f32, f32, f32) {
@@ -611,6 +664,13 @@ pub struct Island {
     px: (i32, i32),
     surf: (i32, i32),
     fonts: Option<Fonts>,
+    /// Blurred, saturated, downscaled monitor capture behind the open panel: (w, h, BGRA).
+    snap: Option<(i32, i32, Vec<u8>)>,
+    snap_bmp: Option<ID2D1Bitmap>,
+    noise_bmp: Option<ID2D1Bitmap>,
+    /// Fractional wheel notches not yet applied, and an eased Sound slider: (target id, target, current).
+    wheel: Option<(usize, f32, f32)>,
+    wheel_hw: Instant,
     /// Cover art per session id with the generation it was decoded from; dropped with the render target.
     arts: std::collections::HashMap<String, (u32, Option<ID2D1Bitmap>)>,
     /// Shell icons by path; dropped whenever the render target is recreated.
@@ -723,6 +783,11 @@ impl Island {
                 px: (1, 1),
                 surf: (0, 0),
                 fonts: None,
+                snap: None,
+                snap_bmp: None,
+                noise_bmp: None,
+                wheel: None,
+                wheel_hw: Instant::now(),
                 arts: Default::default(),
                 icons: Default::default(),
                 tab: Tab::Clip,
@@ -789,7 +854,18 @@ impl Island {
     }
 
     pub fn set_config(&mut self, cfg: &IslandConfig) {
+        if cfg.font != self.cfg.font || cfg.font_size != self.cfg.font_size {
+            self.fonts = None;
+        }
+        let reshoot = cfg.blur != self.cfg.blur || cfg.saturation != self.cfg.saturation;
         self.cfg = cfg.clone();
+        if reshoot {
+            self.snap = None;
+            self.snap_bmp = None;
+            if self.mode == Mode::Open {
+                unsafe { self.capture() };
+            }
+        }
         self.side = parse_side(&cfg.side);
         self.rgb = parse_rgb(&cfg.bg);
         self.store.set_days(cfg.history_days);
@@ -863,27 +939,44 @@ impl Island {
     /// Drag/click on slider n (or usize::MAX - i for monitor i's brightness) at y.
     fn slide_to(&mut self, n: usize, y: f32) {
         let (th, ..) = self.sound_lay();
+        self.wheel = None;
+        if n > usize::MAX - 64 {
+            self.set_level(n, Self::level(y, th + MUTE_D + 6.0), true);
+            return;
+        }
+        self.set_level(n, Self::level(y, th), true);
+    }
+
+    /// Current level of mixer id `n` (0 master, i+1 app i, usize::MAX-i brightness i).
+    fn level_of(&self, n: usize) -> Option<f32> {
+        if n > usize::MAX - 64 {
+            return self.bri.get(usize::MAX - n).copied().flatten();
+        }
+        if n == 0 { Some(self.master.0) } else { self.mix.get(n - 1).map(|c| c.vol) }
+    }
+
+    /// Sets a level on screen; `hw` also pushes it to the device (callers throttle easing frames).
+    fn set_level(&mut self, n: usize, v: f32, hw: bool) {
         if n > usize::MAX - 64 {
             let i = usize::MAX - n;
-            let v = Self::level(y, th + MUTE_D + 6.0);
             if let Some(b) = self.bri.get_mut(i) {
                 *b = Some(v);
-                push_brightness(i, v);
+                if hw { push_brightness(i, v); }
             }
             return;
         }
-        let v = Self::level(y, th);
         if n == 0 {
             self.master = (v, false);
-            mixer::set_master(Some(v), Some(false));
+            if hw { mixer::set_master(Some(v), Some(false)); }
         } else if let Some(ch) = self.mix.get_mut(n - 1) {
             ch.vol = v;
             ch.mute = false;
-            mixer::set_app(&ch.key, Some(v), Some(false));
+            if hw { mixer::set_app(&ch.key, Some(v), Some(false)); }
         }
     }
 
     fn toggle_mute(&mut self, n: usize) {
+        self.wheel = None;
         if n == 0 {
             self.master.1 = !self.master.1;
             mixer::set_master(None, Some(self.master.1));
@@ -1183,6 +1276,7 @@ impl Island {
             }
         }
         if m == Mode::Open {
+            unsafe { self.capture() };
             self.scroll = 0;
             self.scroll_f = 0.0;
             self.tab_a = 1.0;
@@ -1215,6 +1309,8 @@ impl Island {
 
     unsafe fn release_surface(&mut self) {
         self.rt = None;
+        self.snap_bmp = None;
+        self.noise_bmp = None;
         self.arts.clear();
         self.fonts = None;
         if self.has_bmp {
@@ -1306,6 +1402,15 @@ impl Island {
         unsafe { self.pointer(now) };
         let moving = self.step(dt);
         self.row_anim = self.step_rows(dt);
+        if let Some((id, t, c)) = self.wheel {
+            let c = if (t - c).abs() < 0.002 { t } else { c + (t - c) * (1.0 - (-dt * 18.0).exp()) };
+            self.wheel = (c != t).then_some((id, t, c));
+            // Device calls are slow (session enumeration); push every ~50 ms and on the last frame.
+            let hw = c == t || self.wheel_hw.elapsed() >= Duration::from_millis(50);
+            if hw { self.wheel_hw = now; }
+            self.set_level(id, c, hw);
+            self.dirty = true;
+        }
         let mut flashing = false;
         if let Some((_, t)) = self.flash {
             if t.elapsed() < Duration::from_millis(900) {
@@ -1339,7 +1444,7 @@ impl Island {
                 self.dirty = true;
             }
         }
-        if self.mode == Mode::Open && self.tab == Tab::Sound && self.slide.is_none() && now.duration_since(self.mix_t) >= Duration::from_secs(1) {
+        if self.mode == Mode::Open && self.tab == Tab::Sound && self.slide.is_none() && self.wheel.is_none() && now.duration_since(self.mix_t) >= Duration::from_secs(1) {
             let before = (self.mix.clone(), self.master);
             self.sample_mix();
             if (self.mix.clone(), self.master) != before {
@@ -1437,12 +1542,14 @@ impl Island {
 
     unsafe fn ensure_surface(&mut self) -> Result<()> {
         if self.fonts.is_none() {
-            self.fonts = Some(Fonts::new(&self.dw)?);
+            self.fonts = Some(Fonts::new(&self.dw, &self.cfg.font, self.cfg.font_size)?);
         }
         if self.rt.is_some() && self.surf == self.px {
             return Ok(());
         }
         self.rt = None;
+        self.snap_bmp = None;
+        self.noise_bmp = None;
         self.arts.clear();
         if !self.has_bmp || self.surf != self.px {
             let info = BITMAPINFO {
@@ -1494,6 +1601,8 @@ impl Island {
         let ended = rt.EndDraw(None, None);
         if drawn.is_err() || ended.is_err() {
             self.rt = None;
+            self.snap_bmp = None;
+            self.noise_bmp = None;
             self.arts.clear();
             self.icons.clear();
             return drawn.and(ended);
@@ -1514,7 +1623,7 @@ impl Island {
 
     unsafe fn geometry(&self, ext: f32, hh: f32, k: f32) -> Result<ID2D1PathGeometry> {
         let f = F.min(ext * 0.5);
-        let r = (12.0 + 16.0 * k).min(hh).min((ext - f).max(0.0));
+        let r = (12.0 + (self.cfg.radius - 12.0) * k).min(hh).min((ext - f).max(0.0));
         let p = |u: f32, t: f32| {
             let (x, y) = self.m(u, t);
             D2D_POINT_2F { x, y }
@@ -1535,24 +1644,208 @@ impl Island {
         Ok(geo)
     }
 
+    /// Tint colour and alpha for the glass, from the theme knobs.
+    fn tint(&self) -> (f32, f32, f32, f32) {
+        let a = self.cfg.opacity;
+        match self.cfg.tint.as_str() {
+            "light" => (250.0 / 255.0, 251.0 / 255.0, 253.0 / 255.0, a),
+            "accent" => {
+                let (r, g, b) = hsl(self.cfg.accent_hue as f32, 0.6, 0.22);
+                (r, g, b, a)
+            }
+            "clear" => (1.0, 1.0, 1.0, a * 0.6),
+            _ => (self.rgb.0, self.rgb.1, self.rgb.2, a),
+        }
+    }
+
+    /// The closed notch: a dark orb carrying the Beam L mark, scaled by q, at opacity a.
+    unsafe fn orb(&self, rt: &ID2D1DCRenderTarget, br: &ID2D1SolidColorBrush, q: f32, a: f32) -> Result<()> {
+        if q <= 0.02 || a <= 0.0 {
+            return Ok(());
+        }
+        let (cx, cy) = self.m(21.0 * q, 0.0);
+        let r = 15.0 * q;
+        let el = |rad: f32| D2D1_ELLIPSE { point: D2D_POINT_2F { x: cx, y: cy }, radiusX: rad, radiusY: rad };
+        br.SetColor(&color(0.0, 0.0, 0.0, 0.06 * a));
+        rt.FillEllipse(&el(r + 4.0 * q), br);
+        br.SetColor(&color(0.0, 0.0, 0.0, 0.12 * a));
+        rt.FillEllipse(&el(r + 2.0 * q), br);
+        br.SetColor(&color(11.0 / 255.0, 12.0 / 255.0, 15.0 / 255.0, 0.85 * a));
+        rt.FillEllipse(&el(r), br);
+        br.SetColor(&color(1.0, 1.0, 1.0, 0.15 * a));
+        rt.DrawEllipse(&el(r - 0.5 / self.s), br, 1.0 / self.s, None);
+        // Beam L in a 64-unit box drawn 18 units wide.
+        let k = 18.0 * q / 64.0;
+        let (x0, y0) = (cx - 32.0 * k, cy - 32.0 * k);
+        let rr = |x: f32, y: f32, w: f32, h: f32| D2D1_ROUNDED_RECT { rect: rect(x0 + x * k, y0 + y * k, w * k, h * k), radiusX: 4.75 * k, radiusY: 4.75 * k };
+        br.SetColor(&color(1.0, 1.0, 1.0, a));
+        rt.FillRoundedRectangle(&rr(15.0, 10.0, 9.5, 44.0), br);
+        rt.FillRoundedRectangle(&rr(15.0, 44.5, 34.0, 9.5), br);
+        rt.FillEllipse(&D2D1_ELLIPSE { point: D2D_POINT_2F { x: x0 + 44.0 * k, y: y0 + 21.0 * k }, radiusX: 5.25 * k, radiusY: 5.25 * k }, br);
+        Ok(())
+    }
+
+    /// Grab the monitor under the island (the layered island is excluded without CAPTUREBLT),
+    /// downscale, blur and saturate it once per open.
+    unsafe fn capture(&mut self) {
+        self.snap = None;
+        self.snap_bmp = None;
+        if self.cfg.blur == 0 {
+            return;
+        }
+        let (mw, mh) = (self.mon.right - self.mon.left, self.mon.bottom - self.mon.top);
+        if mw <= 0 || mh <= 0 {
+            return;
+        }
+        let d = (self.cfg.blur as f32 * self.s / 2.45).max(2.0);
+        let (sw, sh) = (((mw as f32 / d) as i32).max(1), ((mh as f32 / d) as i32).max(1));
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: sw,
+                biHeight: -sh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        if let Ok(bmp) = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(mem, bmp);
+            SetStretchBltMode(mem, HALFTONE);
+            let ok = StretchBlt(mem, 0, 0, sw, sh, screen, self.mon.left, self.mon.top, mw, mh, SRCCOPY).as_bool();
+            if ok && !bits.is_null() {
+                let _ = GdiFlush();
+                let mut px = std::slice::from_raw_parts(bits as *const u8, (sw * sh * 4) as usize).to_vec();
+                blur_sat(&mut px, sw as usize, sh as usize, self.cfg.saturation as f32 / 100.0);
+                self.snap = Some((sw, sh, px));
+            }
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+        }
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    }
+
+    /// Bitmap brush mapping the capture back onto the monitor, in window DIPs.
+    unsafe fn snap_brush(&mut self, rt: &ID2D1DCRenderTarget) -> Result<Option<ID2D1BitmapBrush>> {
+        let Some((sw, sh, px)) = &self.snap else { return Ok(None) };
+        let (sw, sh) = (*sw, *sh);
+        if self.snap_bmp.is_none() {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let b = rt.CreateBitmap(D2D_SIZE_U { width: sw as u32, height: sh as u32 }, Some(px.as_ptr() as _), (sw * 4) as u32, &props)?;
+            self.snap_bmp = Some(b);
+        }
+        let mw = (self.mon.right - self.mon.left) as f32;
+        let sc = mw / sw as f32 / self.s;
+        let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+        let brp = D2D1_BRUSH_PROPERTIES {
+            opacity: 1.0,
+            transform: Matrix3x2 {
+                M11: sc,
+                M12: 0.0,
+                M21: 0.0,
+                M22: sc,
+                M31: (self.mon.left - self.org.0) as f32 / self.s,
+                M32: (self.mon.top - self.org.1) as f32 / self.s,
+            },
+        };
+        Ok(Some(rt.CreateBitmapBrush(self.snap_bmp.as_ref(), Some(&bp), Some(&brp))?))
+    }
+
+    /// Tiled film grain, cached with the render target.
+    unsafe fn noise(&mut self, rt: &ID2D1DCRenderTarget) -> Result<Option<ID2D1BitmapBrush>> {
+        if self.noise_bmp.is_none() {
+            let mut px = vec![0u8; 64 * 64 * 4];
+            let mut x: u32 = 0x9e37_79b9;
+            for p in px.chunks_mut(4) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let a = (x & 0xff) as f32 / 255.0 * 0.07;
+                let v = if x & 0x100 != 0 { (255.0 * a) as u8 } else { 0 };
+                p[0] = v;
+                p[1] = v;
+                p[2] = v;
+                p[3] = (255.0 * a) as u8;
+            }
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            self.noise_bmp = Some(rt.CreateBitmap(D2D_SIZE_U { width: 64, height: 64 }, Some(px.as_ptr() as _), 256, &props)?);
+        }
+        let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_WRAP, extendModeY: D2D1_EXTEND_MODE_WRAP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR };
+        let s = 1.0 / self.s;
+        let brp = D2D1_BRUSH_PROPERTIES { opacity: 1.0, transform: Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: 0.0, M32: 0.0 } };
+        Ok(Some(rt.CreateBitmapBrush(self.noise_bmp.as_ref(), Some(&bp), Some(&brp))?))
+    }
+
     unsafe fn draw(&mut self, rt: &ID2D1DCRenderTarget) -> Result<()> {
         let (ext, hh, k) = self.shape();
         if ext < 0.5 {
             return Ok(());
         }
         let br = rt.CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 1.0), None)?;
+        // Peek is the logo orb; the glass panel fades in over it as the island opens.
+        let panel = (k / 0.25).clamp(0.0, 1.0);
+        if panel < 1.0 {
+            self.orb(rt, &br, (ext / PEEK_EXT).min(1.0), 1.0 - panel)?;
+        }
+        if panel <= 0.0 {
+            return Ok(());
+        }
         let geo = self.geometry(ext, hh, k)?;
-        let (r, g, b) = self.rgb;
-        br.SetColor(&color(r, g, b, 1.0));
+        let (r, g, b, ta) = self.tint();
+        let snap = self.snap_brush(rt)?;
+        if let Some(sb) = &snap {
+            sb.SetOpacity(panel);
+            rt.FillGeometry(&geo, sb, None::<&ID2D1Brush>);
+        }
+        // Without a backdrop a see-through tint would show the desktop sharp; keep it readable.
+        let ta = if snap.is_none() && self.cfg.blur > 0 { ta.max(0.85) } else { ta };
+        br.SetColor(&color(r, g, b, ta * panel));
         rt.FillGeometry(&geo, &br, None::<&ID2D1Brush>);
-        let light = 0.299 * r + 0.587 * g + 0.114 * b > 0.6;
+        let (l, t, rr, bb) = self.bounds(ext, hh);
+        if self.cfg.sheen {
+            let stops = [
+                D2D1_GRADIENT_STOP { position: 0.0, color: color(1.0, 1.0, 1.0, 0.12 * panel) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: color(1.0, 1.0, 1.0, 0.0) },
+            ];
+            let col = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let lb = rt.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: D2D_POINT_2F { x: l, y: t }, endPoint: D2D_POINT_2F { x: l, y: t + (bb - t) * 0.38 } },
+                None,
+                &col,
+            )?;
+            rt.FillGeometry(&geo, &lb, None::<&ID2D1Brush>);
+        }
+        if self.cfg.grain {
+            if let Some(nb) = self.noise(rt)? {
+                nb.SetOpacity(panel);
+                rt.FillGeometry(&geo, &nb, None::<&ID2D1Brush>);
+            }
+        }
+        if self.cfg.edge > 0.0 {
+            br.SetColor(&color(1.0, 1.0, 1.0, self.cfg.edge * panel));
+            rt.DrawGeometry(&geo, &br, 1.0 / self.s, None);
+        }
+        let light = self.cfg.tint != "clear" && 0.299 * r + 0.587 * g + 0.114 * b > 0.6;
         let fg = if light { (0.06, 0.06, 0.07) } else { (1.0, 1.0, 1.0) };
         let a = ((k - 0.45) / 0.45).clamp(0.0, 1.0);
         let alpha = a * a * (3.0 - 2.0 * a);
         if alpha < 0.01 {
             return Ok(());
         }
-        let (l, t, rr, bb) = self.bounds(ext, hh);
         rt.PushAxisAlignedClip(&rect(l, t, rr - l, bb - t), D2D1_ANTIALIAS_MODE_ALIASED);
         let (ox, oy) = self.co();
         if self.cfg.animation != "none" && alpha < 1.0 {
@@ -2498,7 +2791,7 @@ impl Island {
                     if let Some((apps, master)) = MIX.lock().unwrap_or_else(|e| e.into_inner()).take() {
                         let master = master.unwrap_or(self.master);
                         // Skip while dragging so the poll never fights the finger; repaint only on change.
-                        if self.slide.is_none() && (apps != self.mix || master != self.master) {
+                        if self.slide.is_none() && self.wheel.is_none() && (apps != self.mix || master != self.master) {
                             let grow = apps.len() != self.mix.len();
                             self.mix = apps;
                             self.master = master;
@@ -2804,8 +3097,29 @@ impl Island {
                         }
                     }
                 }
-                WM_MOUSEWHEEL => {
+                WM_MOUSEWHEEL | 0x020E => {
                     let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+                    // Sound tab: wheel (up or right = louder) eases the hovered fader toward a target.
+                    if self.tab == Tab::Sound && !self.picking() {
+                        let id = match self.hover {
+                            Hover::Vol(n) | Hover::Mute(n) => Some(n),
+                            Hover::Bri(i) => Some(usize::MAX - i),
+                            _ => None,
+                        };
+                        if let Some(id) = id {
+                            if let Some(cur) = self.level_of(id) {
+                                let base = match self.wheel { Some((w, t, _)) if w == id => t, _ => cur };
+                                let t = (base + delta as f32 / 120.0 * 0.04).clamp(0.0, 1.0);
+                                let c = match self.wheel { Some((w, _, c)) if w == id => c, _ => cur };
+                                self.wheel = Some((id, t, c));
+                                self.touch();
+                            }
+                        }
+                        return Some(LRESULT(0));
+                    }
+                    if msg != WM_MOUSEWHEEL {
+                        return Some(LRESULT(0));
+                    }
                     // Precision touchpads send deltas under 120; still move one step.
                     let notches = if delta.abs() >= 120 { delta / 120 } else { delta.signum() };
                     if self.tab == Tab::Media && self.cfg.media_controls {

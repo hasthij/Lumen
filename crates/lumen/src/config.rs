@@ -68,11 +68,35 @@ pub struct IslandConfig {
     pub tab_system: bool,
     /// Sticky notes tab.
     pub tab_shelf: bool,
+    /// Look preset: "smoke", "ink", "frost", "liquid", "aura" or "custom".
+    pub theme: String,
+    /// Glass tint: "dark" (uses bg), "light", "accent" or "clear".
+    pub tint: String,
+    /// Accent tint hue, 0-360.
+    pub accent_hue: f32,
+    /// Background blur radius in px, 0-60 (0 = solid).
+    pub blur: u32,
+    /// Blurred backdrop saturation in %, 50-250.
+    pub saturation: u32,
+    /// Edge highlight strength, 0-0.6.
+    pub edge: f32,
+    /// Open-panel corner radius, 12-40.
+    pub radius: f32,
+    /// Fine noise over the glass.
+    pub grain: bool,
+    /// Soft light sheen across the top.
+    pub sheen: bool,
+    /// UI font family.
+    pub font: String,
+    /// Base font size, 11-16.
+    pub font_size: f32,
+    /// Tab bar look: "pills", "segmented" or "underline".
+    pub tab_style: String,
 }
 
 impl Default for IslandConfig {
     fn default() -> Self {
-        Self {
+        let mut c = Self {
             side: "right".into(),
             scale: 1.0,
             animation: "liquid".into(),
@@ -90,11 +114,55 @@ impl Default for IslandConfig {
             tab_launch: false,
             tab_system: false,
             tab_shelf: false,
-        }
+            theme: String::new(),
+            tint: String::new(),
+            accent_hue: 205.0,
+            blur: 0,
+            saturation: 100,
+            edge: 0.0,
+            radius: 28.0,
+            grain: false,
+            sheen: false,
+            font: String::new(),
+            font_size: 13.0,
+            tab_style: String::new(),
+        };
+        c.apply_preset("smoke");
+        c
     }
 }
 
+pub const ISLAND_THEMES: [&str; 5] = ["smoke", "ink", "frost", "liquid", "aura"];
+pub const ISLAND_FONTS: [&str; 5] = ["Segoe UI", "Inter", "Manrope", "Sora", "Outfit"];
+
 impl IslandConfig {
+    /// Sets the look knobs to a named preset (from the design lab).
+    pub fn apply_preset(&mut self, name: &str) {
+        // (tint, blur, opacity, sat, edge, radius, font, tabs, grain, sheen)
+        let (tint, blur, op, sat, edge, radius, font, tabs, fx) = match name {
+            "ink" => ("dark", 0, 0.95, 100, 0.06, 22.0, "Segoe UI", "pills", false),
+            "frost" => ("light", 50, 0.55, 160, 0.40, 30.0, "Manrope", "segmented", true),
+            "liquid" => ("clear", 24, 0.08, 220, 0.45, 36.0, "Sora", "pills", true),
+            "aura" => ("accent", 44, 0.40, 200, 0.24, 30.0, "Outfit", "underline", true),
+            _ => ("dark", 40, 0.38, 180, 0.18, 28.0, "Inter", "pills", true),
+        };
+        self.theme = if ISLAND_THEMES.contains(&name) { name } else { "smoke" }.into();
+        self.tint = tint.into();
+        self.blur = blur;
+        self.opacity = op;
+        self.saturation = sat;
+        self.edge = edge;
+        self.radius = radius;
+        self.font = font.into();
+        self.font_size = 13.0;
+        self.tab_style = tabs.into();
+        self.grain = fx;
+        self.sheen = fx;
+        if name == "ink" || name == "smoke" {
+            self.bg = "#000000".into();
+        }
+    }
+
     pub fn clamp(&mut self) {
         if !matches!(self.side.as_str(), "left" | "right" | "top") {
             self.side = "right".into();
@@ -104,7 +172,25 @@ impl IslandConfig {
         }
         self.scale = self.scale.clamp(0.7, 2.0);
         self.animation_ms = self.animation_ms.clamp(0, 400);
-        self.opacity = self.opacity.clamp(0.4, 1.0);
+        self.opacity = self.opacity.clamp(0.0, 1.0);
+        if !matches!(self.tint.as_str(), "dark" | "light" | "accent" | "clear") {
+            self.tint = "dark".into();
+        }
+        if !matches!(self.tab_style.as_str(), "pills" | "segmented" | "underline") {
+            self.tab_style = "pills".into();
+        }
+        if !matches!(self.theme.as_str(), "smoke" | "ink" | "frost" | "liquid" | "aura" | "custom") {
+            self.theme = "custom".into();
+        }
+        if self.font.trim().is_empty() || self.font.len() > 64 {
+            self.font = "Segoe UI".into();
+        }
+        self.accent_hue = self.accent_hue.rem_euclid(360.0);
+        self.blur = self.blur.min(60);
+        self.saturation = self.saturation.clamp(50, 250);
+        self.edge = self.edge.clamp(0.0, 0.6);
+        self.radius = self.radius.clamp(12.0, 40.0);
+        self.font_size = self.font_size.clamp(11.0, 16.0);
         self.history_days = self.history_days.clamp(1, 30);
         self.nudge_ms = self.nudge_ms.clamp(300, 3000);
         if self.bg.len() != 7 || !self.bg.starts_with('#') || u32::from_str_radix(&self.bg[1..], 16).is_err() {

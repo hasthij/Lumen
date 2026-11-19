@@ -1,11 +1,21 @@
-"""Draws Lumen's icon (black rounded tile, white orb) and writes res/lumen.ico (16..256 px PNG frames).
+"""Draws Lumen's icon (black rounded tile, white Beam L mark) and writes res/lumen.ico (16..256 px PNG frames).
 Pure standard library: python scripts/make_icon.py"""
 import struct, zlib, os
+
+def rrect(x, y, rx, ry, w, h, r):
+    qx = abs(x - (rx + w / 2)) - (w / 2 - r)
+    qy = abs(y - (ry + h / 2)) - (h / 2 - r)
+    return (max(qx, 0) ** 2 + max(qy, 0) ** 2) ** 0.5 + min(max(qx, qy), 0) - r <= 0
+
+def beam(x, y):
+    # Beam L in a 64-unit box: stem, foot, and a dot (matches island orb()).
+    return (rrect(x, y, 15, 10, 9.5, 44, 4.75) or rrect(x, y, 15, 44.5, 34, 9.5, 4.75)
+            or (x - 44) ** 2 + (y - 21) ** 2 <= 5.25 ** 2)
 
 def render(size, ss=4):
     n = size * ss
     px = bytearray(size * size * 4)
-    r_tile, r_orb = size * 0.24, size * 0.2
+    r_tile = size * 0.24
     c = size / 2
     for y in range(size):
         for x in range(size):
@@ -18,7 +28,7 @@ def render(size, ss=4):
                     d = (max(qx, 0) ** 2 + max(qy, 0) ** 2) ** 0.5 + min(max(qx, qy), 0) - r_tile
                     if d <= 0:
                         cov_tile += 1
-                        if ((fx - c) ** 2 + (fy - c) ** 2) ** 0.5 <= r_orb:
+                        if beam(fx * 64 / size, fy * 64 / size):
                             cov_orb += 1
             a = cov_tile / (ss * ss)
             v = cov_orb / (ss * ss)

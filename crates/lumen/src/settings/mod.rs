@@ -86,6 +86,12 @@ enum Slider {
     IslandOpacity,
     IslandNudgeMs,
     IslandHistory,
+    IslandBlur,
+    IslandSat,
+    IslandEdge,
+    IslandRadius,
+    IslandFontSize,
+    IslandHue,
     ClockHue,
     ClockSat,
     TbOpacity(Sit),
@@ -119,6 +125,12 @@ enum Hit {
     IslandNudge,
     IslandPaste,
     IslandFeat(&'static str),
+    IslandPreset(&'static str),
+    IslandTint(&'static str),
+    IslandFont(&'static str),
+    IslandTabs(&'static str),
+    IslandGrain,
+    IslandSheen,
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -187,6 +199,7 @@ pub struct Settings {
     recording: bool,
     dragging: Option<(Slider, Rect)>,
     scroll: f32,
+    scroll_target: f32,
     content_h: f32,
     scale: f32,
     changes: Vec<Change>,
@@ -249,6 +262,7 @@ impl Settings {
             recording: false,
             dragging: None,
             scroll: 0.0,
+            scroll_target: 0.0,
             content_h: 0.0,
             scale,
             changes: Vec::new(),
@@ -377,7 +391,13 @@ impl Settings {
             Slider::AnimSpeed => self.cfg.launcher.animation_ms as f32 / 400.0,
             Slider::IslandScale => (self.cfg.island.scale - 0.7) / 1.3,
             Slider::IslandAnimMs => self.cfg.island.animation_ms as f32 / 400.0,
-            Slider::IslandOpacity => (self.cfg.island.opacity - 0.4) / 0.6,
+            Slider::IslandOpacity => self.cfg.island.opacity,
+            Slider::IslandBlur => self.cfg.island.blur as f32 / 60.0,
+            Slider::IslandSat => (self.cfg.island.saturation as f32 - 50.0) / 200.0,
+            Slider::IslandEdge => self.cfg.island.edge / 0.6,
+            Slider::IslandRadius => (self.cfg.island.radius - 12.0) / 28.0,
+            Slider::IslandFontSize => (self.cfg.island.font_size - 11.0) / 5.0,
+            Slider::IslandHue => self.cfg.island.accent_hue / 360.0,
             Slider::IslandNudgeMs => (self.cfg.island.nudge_ms as f32 - 300.0) / 2700.0,
             Slider::IslandHistory => (self.cfg.island.history_days as f32 - 1.0) / 29.0,
             Slider::ClockHue => hsv_of(&self.sel().color, [1.0; 3]).0 / 360.0,
@@ -414,7 +434,19 @@ impl Settings {
             Slider::AnimSpeed => self.cfg.launcher.animation_ms = ((t * 400.0 / 10.0).round() * 10.0) as u32,
             Slider::IslandScale => self.cfg.island.scale = ((0.7 + t * 1.3) * 20.0).round() / 20.0,
             Slider::IslandAnimMs => self.cfg.island.animation_ms = ((t * 40.0).round() * 10.0) as u32,
-            Slider::IslandOpacity => self.cfg.island.opacity = ((0.4 + t * 0.6) * 100.0).round() / 100.0,
+            Slider::IslandOpacity | Slider::IslandBlur | Slider::IslandSat | Slider::IslandEdge | Slider::IslandRadius | Slider::IslandFontSize | Slider::IslandHue => {
+                let c = &mut self.cfg.island;
+                match s {
+                    Slider::IslandOpacity => c.opacity = (t * 100.0).round() / 100.0,
+                    Slider::IslandBlur => c.blur = (t * 60.0).round() as u32,
+                    Slider::IslandSat => c.saturation = ((50.0 + t * 200.0) / 5.0).round() as u32 * 5,
+                    Slider::IslandEdge => c.edge = (t * 0.6 * 100.0).round() / 100.0,
+                    Slider::IslandRadius => c.radius = (12.0 + t * 28.0).round(),
+                    Slider::IslandFontSize => c.font_size = ((11.0 + t * 5.0) * 2.0).round() / 2.0,
+                    _ => c.accent_hue = (t * 360.0).round(),
+                }
+                c.theme = "custom".into();
+            }
             Slider::IslandNudgeMs => self.cfg.island.nudge_ms = (((300.0 + t * 2700.0) / 100.0).round() * 100.0) as u32,
             Slider::IslandHistory => self.cfg.island.history_days = (1.0 + t * 29.0).round() as u32,
             Slider::ClockHue | Slider::ClockSat => {
@@ -445,6 +477,12 @@ impl Settings {
             Slider::IslandOpacity => format!("{}%", (self.cfg.island.opacity * 100.0).round()),
             Slider::IslandNudgeMs => format!("{} ms", self.cfg.island.nudge_ms),
             Slider::IslandHistory => format!("{} d", self.cfg.island.history_days),
+            Slider::IslandBlur => format!("{} px", self.cfg.island.blur),
+            Slider::IslandSat => format!("{}%", self.cfg.island.saturation),
+            Slider::IslandEdge => format!("{}%", (self.cfg.island.edge / 0.6 * 100.0).round()),
+            Slider::IslandRadius => format!("{} px", self.cfg.island.radius),
+            Slider::IslandFontSize => format!("{} pt", self.cfg.island.font_size),
+            Slider::IslandHue => "Hue".into(),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -474,6 +512,7 @@ impl Settings {
                 }
                 self.page = p;
                 self.scroll = 0.0;
+                self.scroll_target = 0.0;
             }
             Hit::Slider(s, r) => {
                 self.dragging = Some((s, r));
@@ -528,6 +567,26 @@ impl Settings {
             }
             Hit::IslandOutline => {
                 self.cfg.island.outline = !self.cfg.island.outline;
+                self.commit_config();
+            }
+            Hit::IslandPreset(p) => {
+                if p == "custom" {
+                    self.cfg.island.theme = "custom".into(); // keep the current knobs
+                } else {
+                    self.cfg.island.apply_preset(p);
+                }
+                self.commit_config();
+            }
+            Hit::IslandTint(_) | Hit::IslandFont(_) | Hit::IslandTabs(_) | Hit::IslandGrain | Hit::IslandSheen => {
+                let c = &mut self.cfg.island;
+                match hit {
+                    Hit::IslandTint(v) => c.tint = v.into(),
+                    Hit::IslandFont(v) => c.font = v.into(),
+                    Hit::IslandTabs(v) => c.tab_style = v.into(),
+                    Hit::IslandGrain => c.grain = !c.grain,
+                    _ => c.sheen = !c.sheen,
+                }
+                c.theme = "custom".into();
                 self.commit_config();
             }
             Hit::Animation(id) => {
@@ -878,7 +937,7 @@ impl Settings {
             WM_MOUSEWHEEL => {
                 let delta = (wp.0 >> 16) as i16 as f32;
                 let max = (self.content_h - (H - HEADER_H)).max(0.0);
-                self.scroll = (self.scroll - delta / 120.0 * 60.0).clamp(0.0, max);
+                self.scroll_target = (self.scroll_target - delta / 120.0 * 60.0).clamp(0.0, max);
                 self.redraw();
             }
             WM_SETCURSOR => {
@@ -1000,6 +1059,14 @@ impl Settings {
         self.canvas.text(subtitle, Rect::new(CONTENT_X, 62.0, CONTENT_W, 20.0), Font::Text, 12.5, 400, white(0.55), Align::Left);
 
         self.canvas.clip(Rect::new(SIDEBAR, HEADER_H, W - SIDEBAR, H - HEADER_H));
+        // Ease the scroll toward the wheel target (about 1 - e^(-dt*22) per 16 ms frame).
+        let d = self.scroll_target - self.scroll;
+        if d.abs() > 0.5 {
+            self.scroll += d * 0.3;
+            self.animating = true;
+        } else {
+            self.scroll = self.scroll_target;
+        }
         let top = HEADER_H + 4.0 - self.scroll;
         let end = match self.page {
             Page::General => self.page_general(top),
@@ -1490,7 +1557,49 @@ impl Settings {
         y += 72.0 + 20.0;
 
         y = self.section("Look", y);
-        self.card(y, 108.0, Some(('\u{E771}', None)), "Background", "Pure black, or any colour");
+        // Pickers sit on a second row inside a taller card so long option lists fit.
+        let isl = self.cfg.island.clone();
+        let pick = |me: &mut Self, y: f32, glyph: char, title: &str, desc: &str, opts: &[(&'static str, &str)], cur: &str, hit: fn(&'static str) -> Hit| {
+            me.card(y, 108.0, Some((glyph, None)), title, desc);
+            let o: Vec<(&str, Hit)> = opts.iter().map(|(id, n)| (*n, hit(id))).collect();
+            let sel = opts.iter().position(|(id, _)| *id == cur).unwrap_or(usize::MAX);
+            me.segmented(RIGHT, y + 82.0, &o, sel);
+            y + 112.0
+        };
+        y = pick(self, y, '\u{E790}', "Theme", "A preset for every knob below; changing a knob makes it Custom",
+            &[("smoke", "Smoke"), ("ink", "Ink"), ("frost", "Frost"), ("liquid", "Liquid"), ("aura", "Aura"), ("custom", "Custom")], &isl.theme, Hit::IslandPreset);
+        y = pick(self, y, '\u{E771}', "Tint", "Colour laid over the blurred glass",
+            &[("dark", "Dark"), ("light", "Light"), ("accent", "Accent"), ("clear", "Clear")], &isl.tint, Hit::IslandTint);
+        let fonts: Vec<(&'static str, &str)> = crate::config::ISLAND_FONTS.iter().map(|f| (*f, *f)).collect();
+        y = pick(self, y, '\u{E8D2}', "Font", "Falls back to Segoe UI if not installed", &fonts, &isl.font, Hit::IslandFont);
+        y = pick(self, y, '\u{E8A9}', "Tabs", "How the tab bar looks",
+            &[("pills", "Pills"), ("segmented", "Segmented"), ("underline", "Underline")], &isl.tab_style, Hit::IslandTabs);
+        let rows: [(char, &str, &str, Slider); 7] = [
+            ('\u{E793}', "Tint strength", "0% is clear glass, 100% is solid", Slider::IslandOpacity),
+            ('\u{E727}', "Blur", "Background blur; 0 turns the glass off", Slider::IslandBlur),
+            ('\u{E706}', "Saturation", "Colour boost of what shows through", Slider::IslandSat),
+            ('\u{E7B3}', "Edge", "Light rim around the island", Slider::IslandEdge),
+            ('\u{E71A}', "Corner radius", "Roundness of the open panel", Slider::IslandRadius),
+            ('\u{E8E9}', "Text size", "Base font size", Slider::IslandFontSize),
+            ('\u{E790}', "Accent hue", "Used by the Accent tint", Slider::IslandHue),
+        ];
+        for (g, t, d, s) in rows {
+            self.card(y, 68.0, Some((g, None)), t, d);
+            let v = self.slider_label(s);
+            let hue = (s == Slider::IslandHue).then(Self::hue_rail);
+            self.slider(RIGHT - 366.0, y + 34.0, 300.0, s, hue.as_deref());
+            if s != Slider::IslandHue {
+                self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+            }
+            y += 72.0;
+        }
+        self.card(y, 68.0, Some(('\u{E7F4}', None)), "Grain", "Fine noise over the glass");
+        self.toggle(right, y + 34.0, self.cfg.island.grain, Hit::IslandGrain, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E706}', None)), "Sheen", "Soft light across the top");
+        self.toggle(right, y + 34.0, self.cfg.island.sheen, Hit::IslandSheen, true);
+        y += 72.0;
+        self.card(y, 108.0, Some(('\u{E771}', None)), "Background", "Colour of the Dark tint");
         let current = theme::parse_hex(&self.cfg.island.bg).unwrap_or([0.0; 3]);
         let mut x = CONTENT_X + 74.0;
         let cy = y + 84.0;
