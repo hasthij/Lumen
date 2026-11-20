@@ -118,6 +118,10 @@ struct Slot {
     art: Option<Arc<Vec<u8>>>,
     gen: u32,
     tries: u32,
+    /// When the cover was last asked for (retries back off after the first few quick ones).
+    tried_at: Option<Instant>,
+    /// Previous track's cover: apps often still serve it for a moment after the title changes.
+    prev: Option<Arc<Vec<u8>>>,
 }
 
 fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc<AtomicBool>, hwnd: usize, msg: u32) {
@@ -140,6 +144,9 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
     let mut fb_key = String::new();
     let mut fb_gen = 0u32;
     let mut fb_have = false;
+    let fb_busy = Arc::new(AtomicBool::new(false));
+    let mut fb_tries = 0u32;
+    let mut fb_retry = Instant::now();
     loop {
         let cmd = if active.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(500)) {
@@ -223,18 +230,25 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
                         fb_have = false;
                         fb_gen += 1;
                         fb_pos = 0.0;
-                        let slot = fb_art.clone();
-                        let q = format!("{artist} {title}");
-                        std::thread::spawn(move || {
-                            if let Some((bytes, dur)) = fetch_cover(&q) {
-                                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Arc::new(bytes), dur));
-                            }
-                        });
+                        fb_tries = 0;
+                        fb_retry = Instant::now();
                     }
                     let (art, dur) = match fb_art.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                         Some((k, b, d)) if *k == fb_key => (Some(b.clone()), *d),
                         _ => (None, 0.0),
                     };
+                    // A failed lookup (network blip, no match) is retried every 4 s, up to 8 times.
+                    if art.is_none() && fb_tries < 8 && Instant::now() >= fb_retry && !fb_busy.swap(true, Ordering::AcqRel) {
+                        fb_tries += 1;
+                        fb_retry = Instant::now() + Duration::from_secs(4);
+                        let (slot, busy, key, q) = (fb_art.clone(), fb_busy.clone(), fb_key.clone(), format!("{artist} {title}"));
+                        std::thread::spawn(move || {
+                            if let Some((bytes, dur)) = fetch_cover(&q) {
+                                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Arc::new(bytes), dur));
+                            }
+                            busy.store(false, Ordering::Release);
+                        });
+                    }
                     if fb_prev_playing {
                         fb_pos += fb_tick.elapsed().as_secs_f64();
                     }
@@ -292,6 +306,10 @@ fn fetch_cover(query: &str) -> Option<(Vec<u8>, f64)> {
         return None;
     }
     let bytes = run(&["-s", "-m", "10", &url])?;
+    // An error page is not a cover: only JPEG/PNG count, anything else is retried.
+    if !(bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(&[0x89, b'P', b'N', b'G'])) {
+        return None;
+    }
     crate::info!("island media: cover fetched ({} bytes)", bytes.len());
     Some((bytes, dur))
 }
@@ -496,16 +514,20 @@ fn read(s: &Session, slot: &mut Slot) -> Option<Media> {
     // Art often shows up after the title; retry a few times while it is missing.
     let key = format!("{title}\u{1}{artist}");
     let new_track = slot.key != key;
-    if new_track || (slot.art.is_none() && slot.tries < 6) {
+    // Quick retries first, then every 3 s for about a minute (Spotify can post the cover late).
+    let due = slot.art.is_none() && slot.tries < 30 && slot.tried_at.map_or(true, |t| slot.tries < 6 || t.elapsed() >= Duration::from_secs(3));
+    if new_track || due {
         if new_track {
             // Never keep the previous track's cover while the new one loads.
             slot.key = key;
             slot.tries = 0;
-            slot.art = None;
+            slot.prev = slot.art.take();
             slot.gen = slot.gen.wrapping_add(1);
         }
-        let art = thumbnail(&props).map(Arc::new);
-        slot.tries = if art.is_some() { 99 } else { slot.tries + 1 };
+        slot.tried_at = Some(Instant::now());
+        // The same bytes as the last track's cover are probably stale; accept them (same album) only after a few tries.
+        let art = thumbnail(&props).map(Arc::new).filter(|a| slot.tries >= 3 || slot.prev.as_ref() != Some(a));
+        slot.tries += 1;
         if art.is_some() {
             slot.art = art;
             slot.gen = slot.gen.wrapping_add(1);

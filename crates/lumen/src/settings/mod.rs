@@ -129,6 +129,7 @@ enum Hit {
     IslandFont(&'static str),
     IslandTabs(&'static str),
     IslandTabIcons,
+    IslandCoverColors,
     IslandGrain,
     IslandSheen,
     Engine(&'static str),
@@ -587,6 +588,10 @@ impl Settings {
             }
             Hit::IslandTabIcons => {
                 self.cfg.island.tab_icons = !self.cfg.island.tab_icons;
+                self.commit_config();
+            }
+            Hit::IslandCoverColors => {
+                self.cfg.island.cover_colors = !self.cfg.island.cover_colors;
                 self.commit_config();
             }
             Hit::Animation(id) => {
@@ -1580,6 +1585,9 @@ impl Settings {
             &[("pills", "Pills"), ("segmented", "Segmented"), ("underline", "Underline")], &isl.tab_style, Hit::IslandTabs);
         self.card(y, 68.0, Some(('\u{E8B9}', None)), "Tab icons", "Show icons instead of words in the tab bar");
         self.toggle(right, y + 34.0, isl.tab_icons, Hit::IslandTabIcons, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E8D6}', None)), "Album colours", "While Spotify is the front player, tint the island from its album cover");
+        self.toggle(right, y + 34.0, isl.cover_colors, Hit::IslandCoverColors, true);
         y += 72.0;
         let rows: [(char, &str, &str, Slider); 7] = [
             ('\u{E793}', "Tint amount", "How much tint colour covers the glass: 0% none, 100% solid", Slider::IslandOpacity),

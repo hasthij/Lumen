@@ -94,6 +94,8 @@ pub struct IslandConfig {
     pub tab_style: String,
     /// Tab bar shows icons instead of words.
     pub tab_icons: bool,
+    /// Tint the island from the Spotify album cover while Spotify is the front player.
+    pub cover_colors: bool,
 }
 
 impl Default for IslandConfig {
@@ -129,6 +131,7 @@ impl Default for IslandConfig {
             font_size: 13.0,
             tab_style: String::new(),
             tab_icons: false,
+            cover_colors: true,
         };
         c.apply_preset("smoke");
         c

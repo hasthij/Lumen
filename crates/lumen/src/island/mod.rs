@@ -549,6 +549,8 @@ struct Ctx<'a> {
     rt: &'a ID2D1DCRenderTarget,
     br: &'a ID2D1SolidColorBrush,
     fg: (f32, f32, f32),
+    /// Cover accent colour while the Spotify tint is on.
+    acc: Option<(f32, f32, f32)>,
     alpha: f32,
     ox: f32,
     oy: f32,
@@ -557,6 +559,17 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     unsafe fn col(&self, a: f32) {
         self.br.SetColor(&color(self.fg.0, self.fg.1, self.fg.2, a * self.alpha));
+    }
+    /// `rrect` in the cover accent when there is one.
+    unsafe fn rrect_acc(&self, x: f32, y: f32, w: f32, h: f32, r: f32, a: f32) {
+        let Some(c) = self.acc else { return self.rrect(x, y, w, h, r, a) };
+        self.br.SetColor(&color(c.0, c.1, c.2, a * self.alpha));
+        self.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(self.ox + x, self.oy + y, w, h), radiusX: r, radiusY: r }, self.br);
+    }
+    unsafe fn circle_acc(&self, x: f32, y: f32, r: f32, a: f32) {
+        let Some(c) = self.acc else { return self.circle(x, y, r, a) };
+        self.br.SetColor(&color(c.0, c.1, c.2, a * self.alpha));
+        self.rt.FillEllipse(&D2D1_ELLIPSE { point: D2D_POINT_2F { x: self.ox + x, y: self.oy + y }, radiusX: r, radiusY: r }, self.br);
     }
     unsafe fn text(&self, s: &str, f: &IDWriteTextFormat, x: f32, y: f32, w: f32, h: f32, a: f32) {
         self.col(a);
@@ -612,7 +625,7 @@ impl Ctx<'_> {
             }
         }
     }
-    /// Donut gauge: faint full track plus a clockwise arc from 12 o'clock covering `f` (0..1).
+    /// Donut gauge: faint full track plus a clockwise arc from 12 o'clock covering `f` (0..1), square-ended.
     unsafe fn ring(&self, x: f32, y: f32, r: f32, w: f32, f: f32, a: f32, warn: bool) {
         let c = D2D_POINT_2F { x: self.ox + x, y: self.oy + y };
         self.col(0.12);
@@ -646,7 +659,8 @@ impl Ctx<'_> {
         if sink.Close().is_err() {
             return;
         }
-        let cap = D2D1_STROKE_STYLE_PROPERTIES { startCap: D2D1_CAP_STYLE_ROUND, endCap: D2D1_CAP_STYLE_ROUND, ..Default::default() };
+        // Flat caps: square arc ends, no rounded corners.
+        let cap = D2D1_STROKE_STYLE_PROPERTIES { startCap: D2D1_CAP_STYLE_FLAT, endCap: D2D1_CAP_STYLE_FLAT, ..Default::default() };
         let style = fac.CreateStrokeStyle(&cap, None).ok();
         self.rt.DrawGeometry(&geo, self.br, w, style.as_ref());
     }
@@ -701,6 +715,14 @@ pub struct Island {
     anim: std::collections::HashMap<String, (f32, f32, f32)>,
     anim_t: Instant,
     animating: bool,
+    /// Spotify cover tint: which cover (session id, art gen) was analysed, its colour, and the eased colour in use.
+    cov_key: (String, u32),
+    /// Palette as 5 rgb triples: glass base, three glows, accent.
+    cov_tgt: Option<[f32; 15]>,
+    cov_cur: Option<[f32; 15]>,
+    /// The cover shrunk to 48x48 and blurred (BGRA), and its bitmap on the current render target.
+    cov_px: Option<Vec<u8>>,
+    cov_bmp: Option<ID2D1Bitmap>,
     /// Row hover lift / press squash progress (0..1) for row `row_i`.
     row_t: f32,
     press_t: f32,
@@ -814,6 +836,11 @@ impl Island {
                 anim: Default::default(),
                 anim_t: now,
                 animating: false,
+                cov_key: Default::default(),
+                cov_tgt: None,
+                cov_px: None,
+                cov_bmp: None,
+                cov_cur: None,
                 row_t: 0.0,
                 press_t: 0.0,
                 tab_a: 1.0,
@@ -1305,6 +1332,9 @@ impl Island {
                 self.store.save();
             }
         }
+        if m != Mode::Hidden {
+            self.step_cover(f32::INFINITY); // first paint already has the right colour
+        }
         if m == Mode::Open {
             unsafe { self.capture() };
             self.scroll = 0;
@@ -1342,6 +1372,7 @@ impl Island {
         self.snap_bmp = None;
         self.glass = None;
         self.noise_bmp = None;
+        self.cov_bmp = None;
         self.arts.clear();
         self.fonts = None;
         if self.has_bmp {
@@ -1385,6 +1416,44 @@ impl Island {
             self.vel = 0.0;
         }
         true
+    }
+
+    /// Spotify cover tint: reads the front player's cover once per track, then eases the glass colour to it.
+    /// Returns true while the colour is still moving. `dt` of infinity snaps.
+    fn step_cover(&mut self, dt: f32) -> bool {
+        let front = if self.cfg.cover_colors { self.ordered().into_iter().next().filter(|m| m.id.to_ascii_lowercase().contains("spotify")) } else { None };
+        let key = front.as_ref().map(|m| (m.id.clone(), m.art_gen)).unwrap_or_default();
+        if key != self.cov_key {
+            if self.wic.is_none() {
+                self.wic = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok() };
+            }
+            let art = front.and_then(|m| m.art);
+            self.cov_tgt = match (&self.wic, &art) {
+                (Some(wic), Some(b)) => unsafe { cover_palette(wic, b) },
+                _ => None,
+            };
+            self.cov_px = match (&self.wic, &art) {
+                (Some(wic), Some(b)) => unsafe { cover_blur(wic, b) },
+                _ => None,
+            };
+            self.cov_bmp = None;
+            self.cov_key = key;
+        }
+        let (Some(t), Some(c)) = (self.cov_tgt, self.cov_cur) else {
+            // Switching on or off is immediate; only cover-to-cover changes ease.
+            self.cov_cur = self.cov_tgt;
+            return false;
+        };
+        let k = 1.0 - (-dt * 9.0).exp();
+        let mut n = c;
+        for i in 0..15 {
+            n[i] += (t[i] - c[i]) * k;
+        }
+        if (0..15).all(|i| (t[i] - n[i]).abs() < 0.004) {
+            n = t;
+        }
+        self.cov_cur = Some(n);
+        n != t
     }
 
     /// Eases the hovered row's lift and the pressed row's squash; true while still moving.
@@ -1431,7 +1500,7 @@ impl Island {
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
         unsafe { self.pointer(now) };
-        let moving = self.step(dt);
+        let moving = self.step(dt) | self.step_cover(dt);
         self.row_anim = self.step_rows(dt);
         if let Some((id, t, c)) = self.wheel {
             let c = if (t - c).abs() < 0.002 { t } else { c + (t - c) * (1.0 - (-dt * 18.0).exp()) };
@@ -1595,6 +1664,7 @@ impl Island {
         self.snap_bmp = None;
         self.glass = None;
         self.noise_bmp = None;
+        self.cov_bmp = None;
         self.arts.clear();
         if !self.has_bmp || self.surf != self.px {
             let info = BITMAPINFO {
@@ -1651,6 +1721,7 @@ impl Island {
             self.snap_bmp = None;
         self.glass = None;
             self.noise_bmp = None;
+            self.cov_bmp = None;
             self.arts.clear();
             self.icons.clear();
             return drawn.and(ended);
@@ -1695,6 +1766,9 @@ impl Island {
     /// Tint colour and alpha for the glass, from the theme knobs.
     fn tint(&self) -> (f32, f32, f32, f32) {
         let a = self.cfg.opacity;
+        if let Some(p) = self.cov_cur {
+            return (p[0], p[1], p[2], a.max(0.6));
+        }
         match self.cfg.tint.as_str() {
             "light" => (250.0 / 255.0, 251.0 / 255.0, 253.0 / 255.0, a),
             "accent" => {
@@ -1899,6 +1973,52 @@ impl Island {
             rt.FillGeometry(&geo, &br, None::<&ID2D1Brush>);
         }
         let (l, t, rr, bb) = self.bounds(ext, hh);
+        // The front Spotify cover, blurred into soft ambient colour fields behind the panel (static), when the tint is on.
+        if self.cov_bmp.is_none() {
+            if let Some(px) = &self.cov_px {
+                let props = D2D1_BITMAP_PROPERTIES { pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED }, dpiX: 96.0, dpiY: 96.0 };
+                self.cov_bmp = rt.CreateBitmap(D2D_SIZE_U { width: 48, height: 48 }, Some(px.as_ptr() as *const _), 48 * 4, &props).ok();
+            }
+        }
+        let cover = if self.cov_cur.is_some() { self.cov_bmp.clone() } else { None };
+        if let Some(bmp) = &cover {
+            let (w, h) = (rr - l, bb - t);
+            let sz = bmp.GetSize();
+            let k = (w / sz.width.max(1.0)).max(h / sz.height.max(1.0));
+            let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+            let brp = D2D1_BRUSH_PROPERTIES { opacity: panel, transform: Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: l + (w - sz.width * k) / 2.0, M32: t + (h - sz.height * k) / 2.0 } };
+            let ab = rt.CreateBitmapBrush(bmp, Some(&bp), Some(&brp))?;
+            rt.FillGeometry(&geo, &ab, None::<&ID2D1Brush>);
+            // Dark scrim, heavier toward the bottom, so text and controls stay readable on any cover.
+            let stops = [
+                D2D1_GRADIENT_STOP { position: 0.0, color: color(0.0, 0.0, 0.0, 0.3 * panel) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.0, 0.0, 0.0, 0.5 * panel) },
+            ];
+            let col = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let sb = rt.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: D2D_POINT_2F { x: l, y: t }, endPoint: D2D_POINT_2F { x: l, y: bb } },
+                None,
+                &col,
+            )?;
+            rt.FillGeometry(&geo, &sb, None::<&ID2D1Brush>);
+        } else if let Some(p) = self.cov_cur {
+            // No cover bitmap yet: soft colour pools from the palette.
+            let (w, h) = (rr - l, bb - t);
+            for (i, (fx, fy, rad, al)) in [(0.10f32, 0.25f32, 0.85f32, 0.65f32), (0.95, 1.0, 0.8, 0.6), (0.9, 0.0, 0.55, 0.45)].into_iter().enumerate() {
+                let c = (p[3 + i * 3], p[4 + i * 3], p[5 + i * 3]);
+                let stops = [
+                    D2D1_GRADIENT_STOP { position: 0.0, color: color(c.0, c.1, c.2, al * panel) },
+                    D2D1_GRADIENT_STOP { position: 1.0, color: color(c.0, c.1, c.2, 0.0) },
+                ];
+                let col = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+                let gb = rt.CreateRadialGradientBrush(
+                    &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: D2D_POINT_2F { x: l + w * fx, y: t + h * fy }, gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 }, radiusX: w.max(h) * rad, radiusY: w.max(h) * rad * 0.8 },
+                    None,
+                    &col,
+                )?;
+                rt.FillGeometry(&geo, &gb, None::<&ID2D1Brush>);
+            }
+        }
         if self.cfg.sheen {
             let stops = [
                 D2D1_GRADIENT_STOP { position: 0.0, color: color(1.0, 1.0, 1.0, 0.12 * panel) },
@@ -1986,7 +2106,7 @@ impl Island {
     unsafe fn content(&mut self, rt: &ID2D1DCRenderTarget, br: &ID2D1SolidColorBrush, fg: (f32, f32, f32), alpha: f32, ox: f32, oy: f32) -> Result<()> {
         let fo = self.fonts.clone().unwrap();
         let sessions: Vec<media::Media> = self.worker.as_ref().map(|w| w.state.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
-        let c = Ctx { rt, br, fg, alpha, ox, oy };
+        let c = Ctx { rt, br, fg, acc: self.cov_cur.map(|p| (p[12], p[13], p[14])), alpha, ox, oy };
         let (bw, _) = self.cb();
 
         // Tab bar.
@@ -2003,7 +2123,7 @@ impl Island {
             let r = match style {
                 "underline" => {
                     if on || hot {
-                        c.rrect(x + 8.0, 40.0, w - 16.0, 2.0, 1.0, if on { 0.9 } else { 0.3 });
+                        if on { c.rrect_acc(x + 8.0, 40.0, w - 16.0, 2.0, 1.0, 0.95) } else { c.rrect(x + 8.0, 40.0, w - 16.0, 2.0, 1.0, 0.3) }
                     }
                     None
                 }
@@ -2012,7 +2132,7 @@ impl Island {
             };
             if let Some(r) = r {
                 if on || hot {
-                    c.rrect(x, 14.0, w, 28.0, r, if on { 0.16 } else { 0.08 });
+                    if on { c.rrect_acc(x, 14.0, w, 28.0, r, if c.acc.is_some() { 0.32 } else { 0.16 }) } else { c.rrect(x, 14.0, w, 28.0, r, 0.08) }
                 }
             }
             let a = if on { 1.0 } else if hot { 0.8 } else { 0.55 };
@@ -2032,7 +2152,7 @@ impl Island {
         let te = { let t = self.tab_a; 1.0 - (1.0 - t).powi(3) };
         let alpha = alpha * te;
         let ox = ox + (1.0 - te) * 28.0 * self.tab_dir;
-        let c = Ctx { rt, br, fg, alpha, ox, oy };
+        let c = Ctx { rt, br, fg, acc: self.cov_cur.map(|p| (p[12], p[13], p[14])), alpha, ox, oy };
 
         if self.tab == Tab::Clip {
             let cw = bw - 2.0 * PAD;
@@ -2225,20 +2345,21 @@ impl Island {
             // (fraction, label, detail, warn)
             let mut g: Vec<(f32, &str, String, bool)> = vec![
                 (s.cpu, "CPU", "Usage".into(), s.cpu > 0.9),
-                (s.ram, "Memory", format!("{} / {}", gb(s.ram_used), gb(s.ram_total)), s.ram > 0.9),
+                (s.ram, "Memory", if cw / 4.0 < 90.0 { format!("{} used", gb(s.ram_used)) } else { format!("{} / {}", gb(s.ram_used), gb(s.ram_total)) }, s.ram > 0.9),
                 (disk, "Disk C:", format!("{} free", gb(s.disk_free)), disk > 0.9),
             ];
             if let Some((p, chg)) = s.bat {
                 let f = p as f32 / 100.0;
                 g.push((f, "Battery", if chg { "Charging".into() } else { "On battery".into() }, f < 0.2 && !chg));
             }
+            // One row of gauges, side by side.
             let slot = cw / g.len() as f32;
-            let r = (slot / 2.0 - 12.0).min(32.0);
+            let r = (slot / 2.0 - 10.0).min(34.0);
             let cy = 68.0 + r;
             for (i, (f, label, detail, warn)) in g.iter().enumerate() {
                 let x = PAD + slot * i as f32;
                 let cx = x + slot / 2.0;
-                c.ring(cx, cy, r, 6.0, *f, 0.9, *warn);
+                c.ring(cx, cy, r, 12.0, *f, 1.0, *warn);
                 c.text(&format!("{:.0}%", f * 100.0), &fo.num, x, cy - 12.0, slot, 24.0, 0.95);
                 c.text(label, &fo.center, x, cy + r + 8.0, slot, 18.0, 0.85);
                 c.text(detail, &fo.center, x + 2.0, cy + r + 26.0, slot - 4.0, 16.0, 0.45);
@@ -2359,7 +2480,7 @@ impl Island {
         if let Some((bright, v, t)) = self.hud {
             let a = (1.4 - t.elapsed().as_secs_f32()).clamp(0.0, 0.3) / 0.3;
             let (hx, hy) = (bw - PAD - 150.0, 14.0);
-            let cc = Ctx { rt, br, fg, alpha: alpha * a, ox, oy };
+            let cc = Ctx { rt, br, fg, acc: self.cov_cur.map(|p| (p[12], p[13], p[14])), alpha: alpha * a, ox, oy };
             cc.rrect(hx, hy, 150.0, 28.0, 14.0, 0.14);
             cc.text(if bright { "\u{E706}" } else if v <= 0.0 { "\u{E74F}" } else { "\u{E767}" }, &fo.icon, hx + 4.0, hy, 24.0, 28.0, 0.9);
             cc.rrect(hx + 32.0, hy + 12.0, 80.0, 4.0, 2.0, 0.2);
@@ -2389,7 +2510,7 @@ impl Island {
                 (t.0, t.1)
             };
             let (dx, dy, a) = self.ease(&s.id, sx, sy, dt);
-            let cc = Ctx { rt, br, fg, alpha: alpha * a, ox: ox + dx, oy: oy + dy };
+            let cc = Ctx { rt, br, fg, acc: self.cov_cur.map(|p| (p[12], p[13], p[14])), alpha: alpha * a, ox: ox + dx, oy: oy + dy };
             if i < np {
                 self.player(rt, &cc, &fo, s, i);
             } else {
@@ -2462,9 +2583,9 @@ impl Island {
         let bh = if hot_bar { 6.0 } else { 4.0 };
         let by = l.sy + 3.0 - bh / 2.0;
         c.rrect(l.tx, by, l.tw, bh, bh / 2.0, 0.16);
-        c.rrect(l.tx, by, (l.tw * frac).max(0.0), bh, bh / 2.0, 0.9);
+        c.rrect_acc(l.tx, by, (l.tw * frac).max(0.0), bh, bh / 2.0, 0.95);
         if hot_bar {
-            c.circle(l.tx + l.tw * frac, l.sy + 3.0, 6.0, 1.0);
+            c.circle_acc(l.tx + l.tw * frac, l.sy + 3.0, 6.0, 1.0);
         }
         c.text(&clock(shown), &fo.small, l.tx, l.sy + 10.0, 60.0, 16.0, 0.55);
         c.text(&clock(dur), &fo.small_r, l.tx + l.tw - 60.0, l.sy + 10.0, 60.0, 16.0, 0.55);
@@ -2472,7 +2593,7 @@ impl Island {
             let hot = self.hover == h;
             if kind < 2 {
                 let b = if hot { BTN + 4.0 } else { BTN + 2.0 };
-                c.rrect(x - b / 2.0, l.cy - b / 2.0, b, b, BTN_R + 1.0, if hot { 1.0 } else { 0.94 });
+                c.rrect_acc(x - b / 2.0, l.cy - b / 2.0, b, b, BTN_R + 1.0, if hot { 1.0 } else { 0.94 });
                 c.icon(kind, x, l.cy, 11.0, true, 1.0);
             } else {
                 c.rrect(x - BTN / 2.0, l.cy - BTN / 2.0, BTN, BTN, BTN_R, if hot { 0.2 } else { 0.08 });
@@ -3350,6 +3471,96 @@ unsafe fn decode(rt: &ID2D1DCRenderTarget, wic: &IWICImagingFactory, bytes: &[u8
         dpiY: 96.0,
     };
     rt.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(data.as_ptr() as *const _), w * 4, &props).ok()
+}
+
+/// The cover shrunk to 48x48 and blurred smooth: its own colours where they sit, like ambient light.
+unsafe fn cover_blur(wic: &IWICImagingFactory, bytes: &[u8]) -> Option<Vec<u8>> {
+    let stream = wic.CreateStream().ok()?;
+    stream.InitializeFromMemory(bytes).ok()?;
+    let frame = wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).ok()?.GetFrame(0).ok()?;
+    let sc = wic.CreateBitmapScaler().ok()?;
+    sc.Initialize(&frame, 48, 48, WICBitmapInterpolationModeFant).ok()?;
+    let conv = wic.CreateFormatConverter().ok()?;
+    conv.Initialize(&sc, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+    let mut px = vec![0u8; 48 * 48 * 4];
+    conv.CopyPixels(std::ptr::null(), 48 * 4, &mut px).ok()?;
+    blur_sat(&mut px, 48, 48, 1.5);
+    blur_sat(&mut px, 48, 48, 1.0);
+    // Auto-levels: a dark cover (black with a few orange bits) would average to black, so stretch the
+    // brightest blurred area to a fixed level. The panel's dark layer then keeps text readable.
+    let top = px.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2])).max().unwrap_or(0) as f32 / 255.0;
+    let gain = (0.6 / top.max(0.05)).clamp(1.0, 10.0);
+    for p in px.chunks_exact_mut(4) {
+        for c in &mut p[..3] {
+            *c = (*c as f32 * gain).min(255.0) as u8;
+        }
+    }
+    Some(px)
+}
+
+/// The cover's palette as 5 rgb triples: dark glass base, three glows, light accent.
+/// Lightness is fixed per role so white text stays readable on the result.
+unsafe fn cover_palette(wic: &IWICImagingFactory, bytes: &[u8]) -> Option<[f32; 15]> {
+    let stream = wic.CreateStream().ok()?;
+    stream.InitializeFromMemory(bytes).ok()?;
+    let frame = wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).ok()?.GetFrame(0).ok()?;
+    let sc = wic.CreateBitmapScaler().ok()?;
+    sc.Initialize(&frame, 16, 16, WICBitmapInterpolationModeFant).ok()?;
+    let conv = wic.CreateFormatConverter().ok()?;
+    conv.Initialize(&sc, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+    let mut d = [0u8; 16 * 16 * 4];
+    conv.CopyPixels(std::ptr::null(), 64, &mut d).ok()?;
+    // 12 hue buckets weighted by vividness (saturation x brightness): the cover's colours, ranked.
+    let mut bins = [(0.0f32, [0.0f32; 3]); 12];
+    for p in d.chunks_exact(4) {
+        let (r, g, b) = (p[2] as f32 / 255.0, p[1] as f32 / 255.0, p[0] as f32 / 255.0);
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        let c = mx - mn;
+        if c < 0.08 {
+            continue;
+        }
+        let w = c * mx;
+        let h = if mx == r { ((g - b) / c).rem_euclid(6.0) } else if mx == g { (b - r) / c + 2.0 } else { (r - g) / c + 4.0 };
+        let e = &mut bins[(h * 2.0) as usize % 12];
+        e.0 += w;
+        e.1[0] += w * h * 60.0;
+        e.1[1] += w * (c / mx);
+        e.1[2] += w;
+    }
+    // (hue, saturation, weight) per bucket, best first.
+    let mut v: Vec<(f32, f32, f32)> = bins.iter().filter(|b| b.0 > 0.0).map(|b| (b.1[0] / b.0, b.1[1] / b.0, b.0)).collect();
+    v.sort_by(|a, b| b.2.total_cmp(&a.2));
+    // Greyscale covers: neutral glass, soft white accent.
+    let Some(&(h1, s1, w1)) = v.first().filter(|f| f.2 > 0.6) else {
+        let g = hsl(0.0, 0.0, 0.26);
+        let mut p = [0.0f32; 15];
+        for (i, c) in [hsl(0.0, 0.0, 0.08), g, g, g, (0.92, 0.92, 0.94)].iter().enumerate() {
+            p[i * 3..i * 3 + 3].copy_from_slice(&[c.0, c.1, c.2]);
+        }
+        return Some(p);
+    };
+    let far = |h: f32, o: f32| {
+        let d = (h - o).rem_euclid(360.0);
+        d.min(360.0 - d)
+    };
+    // Second and third colours: next-best hues at least 50 degrees apart, else a shifted copy of the first.
+    let (h2, s2) = v.iter().find(|x| far(x.0, h1) >= 50.0 && x.2 > w1 * 0.15).map(|x| (x.0, x.1)).unwrap_or((h1 + 40.0, s1));
+    let (h3, s3) = v.iter().find(|x| far(x.0, h1) >= 50.0 && far(x.0, h2) >= 50.0 && x.2 > w1 * 0.15).map(|x| (x.0, x.1)).unwrap_or((h1 - 35.0, s1));
+    let sat = |s: f32| s.clamp(0.5, 0.85);
+    let mut p = [0.0f32; 15];
+    for (i, c) in [
+        hsl(h1, s1.clamp(0.3, 0.6), 0.09),
+        hsl(h1, sat(s1), 0.36),
+        hsl(h2, sat(s2), 0.34),
+        hsl(h3, sat(s3), 0.32),
+        hsl(h1, 0.9, 0.62),
+    ]
+    .iter()
+    .enumerate()
+    {
+        p[i * 3..i * 3 + 3].copy_from_slice(&[c.0, c.1, c.2]);
+    }
+    Some(p)
 }
 
 /// A saved clipboard image shrunk to fit 64x64, so the cache holds a few KB, not a full screenshot.
