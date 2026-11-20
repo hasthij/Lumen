@@ -3525,24 +3525,24 @@ fn sample_cover() -> Vec<u8> {
     b.extend_from_slice(&1u16.to_le_bytes());
     b.extend_from_slice(&24u16.to_le_bytes());
     b.extend_from_slice(&[0; 24]);
+    // Original sunset-over-water artwork (rows are bottom-up in a BMP).
+    let mix = |a: [f32; 3], c: [f32; 3], t: f32| [a[0] + (c[0] - a[0]) * t, a[1] + (c[1] - a[1]) * t, a[2] + (c[2] - a[2]) * t];
     for y in 0..N {
+        let yy = (N - 1 - y) as f32;
         for x in 0..N {
-            let (dx, dy) = (x as f32 - 128.0, y as f32 - 128.0);
-            let ang = (x as f32 + y as f32) / 510.0;
-            let t = ((dx * dx + dy * dy).sqrt() / 181.0).min(1.0);
-            let h = (0.55 + ang * 0.3) * 6.0;
-            let (s, v) = (0.7, 1.0 - 0.5 * t);
-            let (i, f) = (h.floor(), h - h.floor());
-            let (p, q, r) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
-            let (rr, gg, bb) = match i as i32 % 6 {
-                0 => (v, r, p),
-                1 => (q, v, p),
-                2 => (p, v, r),
-                3 => (p, q, v),
-                4 => (r, p, v),
-                _ => (v, p, q),
-            };
-            b.extend_from_slice(&[(bb * 255.0) as u8, (gg * 255.0) as u8, (rr * 255.0) as u8]);
+            let xf = x as f32;
+            let hor = 168.0;
+            let mut c = if yy < hor { mix([0.07, 0.05, 0.22], [0.95, 0.38, 0.42], (yy / hor).powf(1.6)) } else { mix([0.10, 0.06, 0.24], [0.03, 0.03, 0.12], ((yy - hor) / (N as f32 - hor)).min(1.0)) };
+            let (dx, dy) = (xf - 128.0, yy - 140.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            let slit = yy > 128.0 && ((yy - 128.0) as i32 % 9) < ((yy - 128.0) / 9.0) as i32;
+            if d < 62.0 && yy < hor && !slit {
+                c = mix([1.0, 0.82, 0.40], [0.98, 0.35, 0.55], ((yy - 78.0) / 90.0).clamp(0.0, 1.0));
+            }
+            if yy >= hor && dx.abs() < 46.0 - (yy - hor) * 0.5 && ((yy as i32) % 6) < 3 {
+                c = mix(c, [0.98, 0.45, 0.50], 0.55);
+            }
+            b.extend_from_slice(&[(c[2] * 255.0) as u8, (c[1] * 255.0) as u8, (c[0] * 255.0) as u8]);
         }
     }
     b
