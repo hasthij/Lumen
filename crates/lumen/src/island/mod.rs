@@ -3068,7 +3068,6 @@ impl Island {
         unsafe {
             match msg {
                 WM_FRAME => {
-                    FRAME_PENDING.store(false, Ordering::Release);
                     if FAST.load(Ordering::Relaxed) {
                         self.tick();
                     }
@@ -3754,8 +3753,8 @@ unsafe fn create_window() -> Result<HWND> {
     std::thread::spawn(move || loop {
         if FAST.load(Ordering::Relaxed) {
             let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-            if !FRAME_PENDING.swap(true, Ordering::AcqRel) {
-                let _ = PostMessageW(HWND(h as *mut _), WM_FRAME, WPARAM(0), LPARAM(0));
+            if !FRAME_PENDING.swap(true, Ordering::AcqRel) && PostMessageW(HWND(h as *mut _), WM_FRAME, WPARAM(0), LPARAM(0)).is_err() {
+                FRAME_PENDING.store(false, Ordering::Release);
             }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(15));
@@ -3769,6 +3768,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
         WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
         WM_GETMINMAXINFO | WM_SIZE | WM_MOVE | WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED => return DefWindowProcW(hwnd, msg, wp, lp),
+        // Re-arm the pacer here, not in the handler: a frame that arrives while the app is borrowed (re-entrant
+        // message) is dropped by island_message, and a flag left set would stall the pacer until restart.
+        WM_FRAME => FRAME_PENDING.store(false, Ordering::Release),
         _ => {}
     }
     if let Some(r) = crate::app::island_message(msg, wp, lp) {
