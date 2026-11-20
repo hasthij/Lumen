@@ -972,7 +972,7 @@ impl Island {
             std::thread::sleep(Duration::from_millis(600)); // let the worker's first poll finish before overriding it
             *wk.state.lock().unwrap_or_else(|e| e.into_inner()) = vec![media::Media {
                 id: "Spotify.exe".into(),
-                title: "Golden Hour".into(),
+                title: "Neon Drift".into(),
                 artist: "Lumen Sample".into(),
                 playing: true,
                 pos: 71.0,
@@ -3528,9 +3528,9 @@ fn sample_cover() -> Vec<u8> {
     for y in 0..N {
         for x in 0..N {
             let (dx, dy) = (x as f32 - 128.0, y as f32 - 128.0);
-            let ang = dy.atan2(dx) / std::f32::consts::TAU + 0.5;
+            let ang = (x as f32 + y as f32) / 510.0;
             let t = ((dx * dx + dy * dy).sqrt() / 181.0).min(1.0);
-            let h = ((0.88 + ang * 0.2) % 1.0) * 6.0;
+            let h = (0.55 + ang * 0.3) * 6.0;
             let (s, v) = (0.7, 1.0 - 0.5 * t);
             let (i, f) = (h.floor(), h - h.floor());
             let (p, q, r) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
