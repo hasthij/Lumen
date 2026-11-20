@@ -46,6 +46,17 @@ fn main() {
         let out = args.get(i + 2).cloned().unwrap_or_else(|| "launcher.bmp".into());
         std::process::exit(launcher_snapshot(&q, &out));
     }
+    if let Some(i) = args.iter().position(|a| a == "--island-snapshot") {
+        let tab = args.get(i + 1).cloned().unwrap_or_default();
+        let out = args.get(i + 2).cloned().unwrap_or_else(|| "island.bmp".into());
+        let cfg = config::Config::load();
+        let Ok(mut isl) = island::Island::create(&cfg.island) else { std::process::exit(1) };
+        let code = match isl.snapshot(&tab) {
+            Some((w, h, px)) => write_bmp(&out, w, h, &px),
+            None => 2,
+        };
+        std::process::exit(code);
+    }
     if let Some(i) = args.iter().position(|a| a == "--query") {
         let q = args.get(i + 1).cloned().unwrap_or_default();
         let cfg = config::Config::load();
@@ -155,7 +166,15 @@ fn main() {
 }
 
 fn launcher_snapshot(q: &str, out: &str) -> i32 {
-    let cfg = config::Config::load();
+    let mut cfg = config::Config::load();
+    // LUMEN_SNAP_CLEAN: no file, folder or window results, so screenshots never show personal file names.
+    if std::env::var_os("LUMEN_SNAP_CLEAN").is_some() {
+        for id in ["files", "folder", "windows"] {
+            if let Some(p) = cfg.launcher.plugins.get_mut(id) {
+                p.enabled = false;
+            }
+        }
+    }
     let Ok(mut l) = launcher::Launcher::create(&cfg.launcher, &cfg.appearance) else { return 1 };
     let Some((w, h, px)) = l.snapshot(q) else { return 2 };
     write_bmp(out, w, h, &px)
@@ -184,8 +203,14 @@ fn write_bmp(out: &str, w: u32, h: u32, px: &[u8]) -> i32 {
     bmp.extend_from_slice(&32u16.to_le_bytes());
     bmp.extend_from_slice(&[0; 24]);
     // Composite premultiplied pixels over a dark grey so the white text is visible.
-    let bg = 40.0;
+    let bg: f32 = std::env::var("LUMEN_SNAP_BG").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+    // LUMEN_SNAP_ALPHA keeps the premultiplied pixels and their alpha untouched (for converting to a transparent PNG).
+    let keep = std::env::var_os("LUMEN_SNAP_ALPHA").is_some();
     for p in px.chunks_exact(4) {
+        if keep {
+            bmp.extend_from_slice(p);
+            continue;
+        }
         let a = p[3] as f32 / 255.0;
         for c in &p[..3] {
             bmp.push((*c as f32 + bg * (1.0 - a)).min(255.0) as u8);

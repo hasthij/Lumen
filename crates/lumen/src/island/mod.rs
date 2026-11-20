@@ -896,6 +896,95 @@ impl Island {
         }
     }
 
+    /// For `--island-snapshot`: draws the open island on `tab` into its own bitmap and returns premultiplied BGRA.
+    /// Mixer, notes and launch items are sample data so nothing personal (clipboard history, saved notes) is rendered.
+    pub fn snapshot(&mut self, tab: &str) -> Option<(u32, u32, Vec<u8>)> {
+        unsafe {
+            self.cfg.blur = 0;
+            self.side = Side::Top; // the notch-from-the-top layout
+            self.tab = match tab {
+                "media" => Tab::Media,
+                "sound" => Tab::Sound,
+                "launch" => Tab::Launch,
+                "system" => Tab::System,
+                "notes" | "shelf" => Tab::Shelf,
+                _ => Tab::Clip,
+            };
+            let chan = |n: &str, v: f32, path: String| mixer::Chan { key: n.into(), name: n.into(), path, vol: v, mute: false };
+            let appdata = std::env::var("APPDATA").unwrap_or_default();
+            let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            self.mix = vec![
+                chan("Spotify", 0.72, format!(r"{appdata}\Spotify\Spotify.exe")),
+                chan("Discord", 0.45, format!(r"{local}\Discord\Update.exe")),
+            ];
+            self.master = (0.6, false);
+            self.bri = vec![Some(0.72)];
+            self.items.notes = vec!["Reply to Sam about the build".into(), "Ship 0.5.4, tidy settings".into()];
+            self.items.launch = [r"C:\Windows\System32\notepad.exe", r"C:\Windows\System32\calc.exe", r"C:\Windows\System32\mspaint.exe", r"C:\Windows\explorer.exe"]
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
+            if self.tab == Tab::Media {
+                self.seed_media();
+            }
+            self.mode = Mode::Open;
+            self.show();
+            self.v = 1.0;
+            self.vel = 0.0;
+            self.tab_a = 1.0;
+            self.sample_sys();
+            let _ = self.paint(); // the hidden layered window may refuse the update; the bitmap is drawn either way
+            if self.rt.is_none() || !self.has_bmp {
+                return None;
+            }
+            let (w, h) = (self.px.0 as u32, self.px.1 as u32);
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w as i32,
+                    biHeight: -(h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            let _ = GdiFlush();
+            // GetDIBits needs the bitmap out of its DC; put it back afterwards.
+            SelectObject(self.dc, self.old);
+            let rows = GetDIBits(self.dc, self.bmp, 0, h, Some(px.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
+            SelectObject(self.dc, self.bmp);
+            self.hide();
+            if rows == 0 {
+                return None;
+            }
+            Some((w, h, px))
+        }
+    }
+
+    /// For `--island-snapshot media`: one sample Spotify session with a generated cover, so the real Media tab
+    /// (cover, colour tint, controls) renders without anything having to be playing.
+    fn seed_media(&mut self) {
+        if let Some(wk) = self.worker.as_ref() {
+            wk.active.store(false, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(600)); // let the worker's first poll finish before overriding it
+            *wk.state.lock().unwrap_or_else(|e| e.into_inner()) = vec![media::Media {
+                id: "Spotify.exe".into(),
+                title: "Golden Hour".into(),
+                artist: "Lumen Sample".into(),
+                playing: true,
+                pos: 71.0,
+                dur: 243.0,
+                at: Instant::now(),
+                art: Some(Arc::new(sample_cover())),
+                art_gen: 1,
+            }];
+        }
+        self.step_cover(f32::INFINITY);
+    }
+
     pub fn set_config(&mut self, cfg: &IslandConfig) {
         if cfg.font != self.cfg.font || cfg.font_size != self.cfg.font_size {
             self.fonts = None;
@@ -3420,6 +3509,43 @@ impl Drop for Island {
             let _ = DeleteDC(self.dc);
         }
     }
+}
+
+/// A 256x256 warm-to-violet sweep, as a 24-bit BMP (WIC decodes it like any cover). Used only by `--island-snapshot media`.
+fn sample_cover() -> Vec<u8> {
+    const N: usize = 256;
+    let mut b = Vec::with_capacity(54 + N * N * 3);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&((54 + N * N * 3) as u32).to_le_bytes());
+    b.extend_from_slice(&[0; 4]);
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(N as i32).to_le_bytes());
+    b.extend_from_slice(&(N as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&[0; 24]);
+    for y in 0..N {
+        for x in 0..N {
+            let (dx, dy) = (x as f32 - 128.0, y as f32 - 128.0);
+            let ang = dy.atan2(dx) / std::f32::consts::TAU + 0.5;
+            let t = ((dx * dx + dy * dy).sqrt() / 181.0).min(1.0);
+            let h = ((0.88 + ang * 0.2) % 1.0) * 6.0;
+            let (s, v) = (0.7, 1.0 - 0.5 * t);
+            let (i, f) = (h.floor(), h - h.floor());
+            let (p, q, r) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+            let (rr, gg, bb) = match i as i32 % 6 {
+                0 => (v, r, p),
+                1 => (q, v, p),
+                2 => (p, v, r),
+                3 => (p, q, v),
+                4 => (r, p, v),
+                _ => (v, p, q),
+            };
+            b.extend_from_slice(&[(bb * 255.0) as u8, (gg * 255.0) as u8, (rr * 255.0) as u8]);
+        }
+    }
+    b
 }
 
 unsafe fn shell_icon(rt: &ID2D1DCRenderTarget, wic: &IWICImagingFactory, path: &str) -> Option<ID2D1Bitmap> {
