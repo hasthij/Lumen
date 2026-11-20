@@ -933,7 +933,14 @@ impl Island {
             self.vel = 0.0;
             self.tab_a = 1.0;
             self.sample_sys();
-            let _ = self.paint(); // the hidden layered window may refuse the update; the bitmap is drawn either way
+            // Paint until card fade-ins settle; the hidden layered window may refuse the update, the bitmap is drawn either way.
+            for _ in 0..40 {
+                let _ = self.paint();
+                if !self.animating {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
             if self.rt.is_none() || !self.has_bmp {
                 return None;
             }
