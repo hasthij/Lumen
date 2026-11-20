@@ -1500,6 +1500,10 @@ impl Island {
                 unsafe { self.release_surface() };
             }
         }
+        if !self.shown {
+            // Nothing to paint while hidden; a stale dirty flag would pin the 16 ms vsync loop on forever (show() repaints anyway).
+            self.dirty = false;
+        }
         if self.shown && (moving || self.dirty || flashing || self.animating || self.row_anim) {
             unsafe {
                 if self.paint().is_err() {
