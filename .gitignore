@@ -1,3 +1,8 @@
 /target
 /lumen-logs
 /dist
+
+# scripts and docs stay local (main README excepted)
+*.ps1
+*.md
+!/README.md

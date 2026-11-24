@@ -38,6 +38,8 @@ pub struct Modules {
 pub struct MacNotifConfig {
     /// "tl", "tr", "bl" or "br".
     pub corner: String,
+    /// Which screen shows the stack: "cursor" (under the mouse), "active" (the focused window's) or "primary".
+    pub monitor: String,
     /// "stack" (piled, fans out on hover) or "tile" (always a list).
     pub mode: String,
     /// "new" puts the newest at the corner, "old" the oldest.
@@ -55,6 +57,12 @@ pub struct MacNotifConfig {
     /// Glass tint strength, percent.
     pub tint: u32,
     pub radius: u32,
+    /// Icon square size in px, 36-56.
+    pub icon_size: u32,
+    /// Draw the tinted square behind the icon.
+    pub icon_bg: bool,
+    /// Keep refreshing the blurred backdrop so it follows what is behind the cards.
+    pub live_blur: bool,
     /// Keep showing while a fullscreen app or game is in front.
     pub over_fullscreen: bool,
     /// Stay quiet while Windows Focus / Do not disturb is on.
@@ -67,6 +75,7 @@ impl Default for MacNotifConfig {
     fn default() -> Self {
         Self {
             corner: "tr".into(),
+            monitor: "cursor".into(),
             mode: "stack".into(),
             order: "new".into(),
             max_shown: 4,
@@ -78,6 +87,9 @@ impl Default for MacNotifConfig {
             saturation: 150,
             tint: 55,
             radius: 20,
+            icon_size: 36,
+            icon_bg: true,
+            live_blur: false,
             over_fullscreen: false,
             respect_focus: true,
             block_windows: true,
@@ -89,6 +101,9 @@ impl MacNotifConfig {
     pub fn clamp(&mut self) {
         if !["tl", "tr", "bl", "br"].contains(&self.corner.as_str()) {
             self.corner = "tr".into();
+        }
+        if !["cursor", "active", "primary"].contains(&self.monitor.as_str()) {
+            self.monitor = "cursor".into();
         }
         if !["stack", "tile"].contains(&self.mode.as_str()) {
             self.mode = "stack".into();
@@ -105,6 +120,7 @@ impl MacNotifConfig {
         self.saturation = self.saturation.clamp(50, 250);
         self.tint = self.tint.clamp(20, 95);
         self.radius = self.radius.clamp(8, 30);
+        self.icon_size = self.icon_size.clamp(36, 56);
     }
 }
 

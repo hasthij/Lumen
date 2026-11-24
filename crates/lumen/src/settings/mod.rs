@@ -105,6 +105,7 @@ enum Slider {
     MnSat,
     MnTint,
     MnRadius,
+    MnIcon,
     TbOpacity(Sit),
     TbHue(Sit),
     TbLight(Sit),
@@ -144,10 +145,13 @@ enum Hit {
     IslandGrain,
     IslandSheen,
     MnCorner(&'static str),
+    MnMonitor(&'static str),
     MnMode(&'static str),
     MnOrder(&'static str),
     MnFullscreen,
     MnFocus,
+    MnIconBg,
+    MnLive,
     MnBlockWin,
     MnTest,
     MnTestApp(u8),
@@ -434,6 +438,7 @@ impl Settings {
             Slider::MnSat => (self.cfg.macnotif.saturation as f32 - 50.0) / 200.0,
             Slider::MnTint => (self.cfg.macnotif.tint as f32 - 20.0) / 75.0,
             Slider::MnRadius => (self.cfg.macnotif.radius as f32 - 8.0) / 22.0,
+            Slider::MnIcon => (self.cfg.macnotif.icon_size as f32 - 36.0) / 20.0,
             Slider::TbOpacity(s) => self.look(s).opacity,
             Slider::TbHue(s) => hsv_of(&self.look(s).color, [0.0; 3]).0 / 360.0,
             Slider::TbLight(s) => hsv_of(&self.look(s).color, [0.0; 3]).2,
@@ -497,6 +502,7 @@ impl Settings {
             Slider::MnSat => self.cfg.macnotif.saturation = (50.0 + t * 200.0).round() as u32,
             Slider::MnTint => self.cfg.macnotif.tint = (20.0 + t * 75.0).round() as u32,
             Slider::MnRadius => self.cfg.macnotif.radius = (8.0 + t * 22.0).round() as u32,
+            Slider::MnIcon => self.cfg.macnotif.icon_size = (36.0 + t * 20.0).round() as u32,
             Slider::TbOpacity(sit) => self.look_mut(sit).opacity = (t * 100.0).round() / 100.0,
             Slider::TbHue(sit) | Slider::TbLight(sit) => {
                 let (h, _, v) = hsv_of(&self.look(sit).color, [0.0; 3]);
@@ -534,6 +540,7 @@ impl Settings {
             Slider::MnSat => format!("{}%", self.cfg.macnotif.saturation),
             Slider::MnTint => format!("{}%", self.cfg.macnotif.tint),
             Slider::MnRadius => format!("{} px", self.cfg.macnotif.radius),
+            Slider::MnIcon => format!("{} px", self.cfg.macnotif.icon_size),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -588,6 +595,10 @@ impl Settings {
                 self.cfg.macnotif.corner = c.into();
                 self.commit_config();
             }
+            Hit::MnMonitor(m) => {
+                self.cfg.macnotif.monitor = m.into();
+                self.commit_config();
+            }
             Hit::MnMode(m) => {
                 self.cfg.macnotif.mode = m.into();
                 self.commit_config();
@@ -598,6 +609,14 @@ impl Settings {
             }
             Hit::MnFullscreen => {
                 self.cfg.macnotif.over_fullscreen = !self.cfg.macnotif.over_fullscreen;
+                self.commit_config();
+            }
+            Hit::MnLive => {
+                self.cfg.macnotif.live_blur = !self.cfg.macnotif.live_blur;
+                self.commit_config();
+            }
+            Hit::MnIconBg => {
+                self.cfg.macnotif.icon_bg = !self.cfg.macnotif.icon_bg;
                 self.commit_config();
             }
             Hit::MnFocus => {
@@ -1744,6 +1763,11 @@ impl Settings {
         let sel = corners.iter().position(|(id, _)| *id == mn.corner).unwrap_or(1);
         self.segmented(right, y + 34.0, &opts, sel);
         y += 72.0;
+        self.card(y, 68.0, Some(('\u{E7F4}', None)), "Screen", "Which monitor shows the stack when you have several");
+        let opts = [("Under cursor", Hit::MnMonitor("cursor")), ("Active window", Hit::MnMonitor("active")), ("Primary", Hit::MnMonitor("primary"))];
+        let sel = match mn.monitor.as_str() { "active" => 1, "primary" => 2, _ => 0 };
+        self.segmented(right, y + 34.0, &opts, sel);
+        y += 72.0;
         self.card(y, 68.0, Some(('\u{E8FD}', None)), "Style", "Stack piles them up and fans out on hover; Tile lists them all");
         let opts = [("Stack", Hit::MnMode("stack")), ("Tile", Hit::MnMode("tile"))];
         self.segmented(right, y + 34.0, &opts, if mn.mode == "tile" { 1 } else { 0 });
@@ -1752,13 +1776,14 @@ impl Settings {
         let opts = [("Newest first", Hit::MnOrder("new")), ("Oldest first", Hit::MnOrder("old"))];
         self.segmented(right, y + 34.0, &opts, if mn.order == "old" { 1 } else { 0 });
         y += 72.0;
-        let rows: [(char, &str, &str, Slider); 6] = [
+        let rows: [(char, &str, &str, Slider); 7] = [
             ('\u{E8FD}', "Shown at once", "More than this collapses into a +N pill", Slider::MnMax),
             ('\u{E916}', "Stay time", "Seconds before a card goes away; 0 keeps it until clicked", Slider::MnTimeout),
             ('\u{E740}', "Width", "Width of each card", Slider::MnWidth),
             ('\u{E8A0}', "Gap", "Space between cards when tiled or fanned out", Slider::MnGap),
             ('\u{E7B3}', "Screen margin", "Distance from the screen edge", Slider::MnMargin),
             ('\u{E71A}', "Corner radius", "Roundness of each card", Slider::MnRadius),
+            ('\u{E8B9}', "Icon size", "Size of the app icon or chat avatar on each card", Slider::MnIcon),
         ];
         for (g, t, d, s) in rows {
             self.card(y, 68.0, Some((g, None)), t, d);
@@ -1767,6 +1792,9 @@ impl Settings {
             self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
             y += 72.0;
         }
+        self.card(y, 68.0, Some(('\u{E7C9}', None)), "Icon background", "Tinted square behind the icon; off shows the bare icon or avatar");
+        self.toggle(right, y + 34.0, mn.icon_bg, Hit::MnIconBg, true);
+        y += 72.0;
         y += 20.0;
 
         y = self.section("Glass", y);
@@ -1782,6 +1810,9 @@ impl Settings {
             self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
             y += 72.0;
         }
+        self.card(y, 68.0, Some(('\u{E895}', None)), "Live backdrop", "Keeps the blur following what is behind the cards (uses a little more CPU)");
+        self.toggle(right, y + 34.0, mn.live_blur, Hit::MnLive, true);
+        y += 72.0;
         y - 4.0
     }
 

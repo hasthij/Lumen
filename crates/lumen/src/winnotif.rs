@@ -159,17 +159,25 @@ fn read(n: &windows::UI::Notifications::UserNotification) -> Option<Notice> {
     }
     let title = texts.remove(0);
     let exe = if aumid.is_empty() { String::new() } else { format!("shell:AppsFolder\\{aumid}") };
-    let image = avatar(&first);
+    let (image, silent) = avatar(&first);
+    // A toast marked silent leaves the sound to the app. Apps that do play their own (chat apps) are
+    // left alone; any other silent one gets the Windows notification sound so it is not mute.
+    if silent && !SELF_SOUND.iter().any(|a| aumid.to_lowercase().contains(a) || label.to_lowercase().contains(a)) {
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+        unsafe {
+            let _ = PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+        }
+    }
     Some(Notice { app: label, title, text: texts.join(" "), exe, image, ..Default::default() })
 }
 
 /// The picture a toast carries (a Discord avatar, a Telegram chat photo). The listener API does not
 /// expose it, so it is read out of Windows' notification store: the newest record with this title.
-fn avatar(title: &str) -> String {
+fn avatar(title: &str) -> (String, bool) {
     let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("Microsoft").join("Windows").join("Notifications");
     let needle = title.as_bytes();
     if needle.is_empty() {
-        return String::new();
+        return (String::new(), false);
     }
     for name in ["wpndatabase.db-wal", "wpndatabase.db"] {
         let Ok(buf) = std::fs::read(dir.join(name)) else { continue };
@@ -179,19 +187,65 @@ fn avatar(title: &str) -> String {
         let stop = (at + 2500).min(buf.len());
         let to = buf[at..stop].windows(8).position(|w| w == b"</toast>").map_or(stop, |p| at + p);
         let tail = &buf[from..to];
-        let key = b"appLogoOverride\" src=\"";
-        if let Some(k) = tail.windows(key.len()).position(|w| w == key) {
-            let rest = &tail[k + key.len()..];
-            if let Some(end) = rest.iter().position(|&b| b == b'"') {
-                let path = String::from_utf8_lossy(&rest[..end]).replace('/', "\\");
-                if std::path::Path::new(&path).exists() {
-                    return path;
+        let silent = tail.windows(13).any(|w| w == b"silent=\"true\"");
+        // Find the <image ... placement="appLogoOverride" ...> tag (attributes in any order) and read its src.
+        let marker = b"appLogoOverride";
+        if let Some(k) = tail.windows(marker.len()).position(|w| w == marker) {
+            let lo = tail[..k].iter().rposition(|&b| b == b'<').unwrap_or(0);
+            let hi = tail[k..].iter().position(|&b| b == b'>').map_or(tail.len(), |p| k + p);
+            let tag = String::from_utf8_lossy(&tail[lo..hi]).into_owned();
+            if let Some(i) = tag.find("src=\"") {
+                let rest = &tag[i + 5..];
+                if let Some(end) = rest.find('"') {
+                    let mut src = rest[..end].replace("&amp;", "&");
+                    if let Some(r) = src.strip_prefix("file:///").or_else(|| src.strip_prefix("file://")) {
+                        src = r.replace("%20", " ");
+                    }
+                    if let Some(path) = stash(&src) {
+                        return (path, silent);
+                    }
                 }
             }
         }
+        return (String::new(), silent);
     }
-    String::new()
+    (String::new(), false)
 }
+
+/// Keeps a copy of a toast picture under %TEMP%\LumenAvatars: apps delete their own temp files
+/// right after showing the toast, and http(s) pictures (Discord's CDN) are fetched with curl.exe.
+fn stash(src: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let dir = std::env::temp_dir().join("LumenAvatars");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    let ext = if src.to_lowercase().contains(".webp") { "webp" } else if src.to_lowercase().contains(".jpg") || src.to_lowercase().contains(".jpeg") { "jpg" } else { "png" };
+    let dest = dir.join(format!("{:016x}.{ext}", h.finish()));
+    if !dest.exists() {
+        if src.starts_with("http://") || src.starts_with("https://") {
+            use std::os::windows::process::CommandExt;
+            let ok = std::process::Command::new("curl.exe")
+                .args(["-sfL", "-m", "3", "-o"])
+                .arg(&dest)
+                .arg(src)
+                .creation_flags(0x0800_0000)
+                .status()
+                .map_or(false, |s| s.success());
+            if !ok {
+                let _ = std::fs::remove_file(&dest);
+                return None;
+            }
+        } else {
+            let path = src.replace('/', "\\");
+            std::fs::copy(&path, &dest).ok()?;
+        }
+    }
+    Some(dest.to_string_lossy().into_owned())
+}
+
+/// Apps that play their own message sound when a toast is silent.
+const SELF_SOUND: [&str; 8] = ["discord", "telegram", "whatsapp", "slack", "teams", "signal", "spotify", "skype"];
 
 // ---- Muting Windows' own banners ----------------------------------------------------------
 

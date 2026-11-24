@@ -36,6 +36,7 @@ pub struct Fonts {
     system: IDWriteFontCollection,
     files: Vec<FontFile>,
     formats: HashMap<(String, u32, bool, u32), IDWriteTextFormat>,
+    layouts: HashMap<String, IDWriteTextLayout>,
 }
 
 impl Fonts {
@@ -46,7 +47,7 @@ impl Fonts {
             let base: IDWriteFactory = dwrite.cast()?;
             base.GetSystemFontCollection(&mut system, false)?;
             let system = system.ok_or_else(windows::core::Error::empty)?;
-            Ok(Self { dwrite, system, files: Vec::new(), formats: HashMap::new() })
+            Ok(Self { dwrite, system, files: Vec::new(), formats: HashMap::new(), layouts: HashMap::new() })
         }
     }
 
@@ -56,6 +57,7 @@ impl Fonts {
     pub fn load_dir(&mut self, dir: &Path, cache: &Path) {
         self.files.clear();
         self.formats.clear();
+        self.layouts.clear();
         let Ok(entries) = std::fs::read_dir(dir) else {
             crate::warn!("no fonts folder at {}", dir.display());
             return self.load_cached_only(cache);
@@ -206,6 +208,13 @@ impl Fonts {
     }
 
     pub fn layout(&mut self, text: &str, style: &TextStyle) -> Result<IDWriteTextLayout> {
+        let key = format!("{}\u{1}{}|{}|{}|{}|{:?}", text, style.face, style.size, style.weight, style.italic, style.spacing);
+        if let Some(l) = self.layouts.get(&key) {
+            return Ok(l.clone());
+        }
+        if self.layouts.len() > 512 {
+            self.layouts.clear();
+        }
         let format = self.format(style)?;
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
@@ -215,6 +224,7 @@ impl Fonts {
                 let range = DWRITE_TEXT_RANGE { startPosition: 0, length: wide.len() as u32 };
                 l1.SetCharacterSpacing(style.spacing[0], style.spacing[1], style.spacing[2], range)?;
             }
+            self.layouts.insert(key, layout.clone());
             Ok(layout)
         }
     }

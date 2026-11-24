@@ -11,7 +11,7 @@ use std::time::Instant;
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HALFTONE, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -25,7 +25,7 @@ use crate::launcher::shell;
 use crate::rainmeter::skin::{Item, Rgba, Scene, TextStyle};
 
 /// Card height and layout constants, in 96-DPI pixels.
-const CARD_H: f32 = 84.0;
+const CARD_H: f32 = 90.0;
 /// Message lines a card can show; each one past the second makes the card taller.
 const MAX_LINES: usize = 5;
 
@@ -83,6 +83,8 @@ struct Card {
 
 #[derive(Clone, Copy)]
 struct Target {
+    /// Where the group's front card sits (g, h, s): cards that appear grow out from behind it.
+    fr: (f32, f32, f32),
     g: f32,
     h: f32,
     s: f32,
@@ -122,12 +124,17 @@ pub struct MacNotif {
     dirty: bool,
     scale: f32,
     scene_h: f32,
+    scene_floor: f32,
+    was_moving: bool,
     clear_rect: Option<(f32, f32, f32, f32)>,
     sample: usize,
     /// Screen rect and look of the blurred backdrop last captured; None when there is none.
     bd_key: Option<(i32, i32, u32, u32, u32, u32)>,
     /// A new capture is due (cards appeared again, or the look changed).
     bd_stale: bool,
+    bd_at: Instant,
+    /// Monitor the stack is on (HMONITOR); re-picked whenever the stack is empty.
+    mon: isize,
 }
 
 impl MacNotif {
@@ -149,22 +156,26 @@ impl MacNotif {
             last: Instant::now(),
             timer_ms: 0,
             dirty: false,
-            scale: dpi_scale(),
+            scale: dpi_scale(pick_monitor("primary")),
             scene_h: TOP + CARD_H,
+            scene_floor: 0.0,
+            was_moving: false,
             clear_rect: None,
             sample: 0,
             bd_key: None,
             bd_stale: true,
+            bd_at: Instant::now(),
+            mon: pick_monitor("primary").0 as isize,
         })
     }
 
     pub fn set_config(&mut self, cfg: &MacNotifConfig) {
-        let rewrap = cfg.width != self.cfg.width;
+        let rewrap = cfg.width != self.cfg.width || cfg.icon_size != self.cfg.icon_size;
         self.cfg = cfg.clone();
         if rewrap {
             let w = self.cfg.width as f32;
             for c in &mut self.cards {
-                let (t, l) = wrap(&mut self.fonts, &c.raw_title, &c.raw_text, w);
+                let (t, l) = wrap(&mut self.fonts, &c.raw_title, &c.raw_text, w, self.cfg.icon_size as f32);
                 c.title = t;
                 c.lines = l;
             }
@@ -193,10 +204,17 @@ impl MacNotif {
         } else {
             "Notification".to_string()
         };
-        let (title, lines) = wrap(&mut self.fonts, &n.title, &n.text, self.cfg.width as f32);
+        let (title, lines) = wrap(&mut self.fonts, &n.title, &n.text, self.cfg.width as f32, self.cfg.icon_size as f32);
         let h0 = card_h(&lines);
         if self.cards.len() >= 40 {
             self.cards.remove(0);
+        }
+        if self.cards.is_empty() {
+            let m = pick_monitor(&self.cfg.monitor).0 as isize;
+            if m != self.mon {
+                self.mon = m;
+                self.bd_stale = true;
+            }
         }
         self.cards.push(Card {
             id: self.next,
@@ -374,12 +392,12 @@ impl MacNotif {
                         off += ch + gap;
                         fan_span = off - gap;
                     }
-                    Target { g, h: ch, s: if vis { 1.0 } else { 0.9 }, a: if vis { 1.0 } else { 0.0 }, slab: false }
+                    Target { fr: (y, top_h, 1.0), g, h: ch, s: if vis { 1.0 } else { 0.9 }, a: if vis { 1.0 } else { 0.0 }, slab: false }
                 } else {
                     let k = i.min(3) as f32;
                     let s = 1.0 - k * 0.06;
                     let h = ch * s;
-                    Target { g: y + top_h + k * PEEK - h, h, s, a: if i > 3 || !shown_group { 0.0 } else { 1.0 - k * 0.18 }, slab: i > 0 }
+                    Target { fr: (y, top_h, 1.0), g: y + top_h + k * PEEK - h, h, s, a: if i > 3 || !shown_group { 0.0 } else { 1.0 - k * 0.18 }, slab: i > 0 }
                 };
                 if t.a == 0.0 {
                     hidden += 1;
@@ -432,9 +450,10 @@ impl MacNotif {
 
     fn tick(&mut self) {
         let now = Instant::now();
-        let dt = now.duration_since(self.last).as_secs_f32().min(0.1);
+        let dt = now.duration_since(self.last).as_secs_f32().min(0.05);
         self.last = now;
-        if now.duration_since(self.fs_checked).as_millis() >= 500 {
+        // The shell query can stall for tens of ms: never ask in the middle of an animation.
+        if !self.was_moving && now.duration_since(self.fs_checked).as_millis() >= 500 {
             self.fs_checked = now;
             let hold = (!self.cfg.over_fullscreen && fullscreen_busy()) || (self.cfg.respect_focus && focus_on());
             if hold != self.suppressed {
@@ -453,7 +472,7 @@ impl MacNotif {
             self.set_timer(500);
             return;
         }
-        self.scale = dpi_scale();
+        self.scale = dpi_scale(HMONITOR(self.mon as _));
         self.poll_hover();
         // The countdown waits while the mouse is over the stack.
         if !self.hovered && self.cfg.timeout_s > 0 {
@@ -476,12 +495,22 @@ impl MacNotif {
             self.dirty = false;
             let t0 = Instant::now();
             self.render();
+            if t0.elapsed().as_millis() > 8 {
+                crate::warn!("macnotif frame took {} ms", t0.elapsed().as_millis());
+            }
             // A slow first draw (loading an app icon) must not eat the slide-in.
             if t0.elapsed().as_millis() > 50 {
                 self.last = Instant::now();
             }
         }
-        self.set_timer(if moving { 16 } else { 100 });
+        // Live backdrop: refresh the blur a few times a second, only while the cards are at rest.
+        if self.cfg.live_blur && self.cfg.blur > 0 && self.bd_at.elapsed().as_millis() >= if moving { 120 } else { 50 } {
+            self.bd_stale = true;
+            self.dirty = true;
+        }
+        self.was_moving = moving;
+        let idle = if self.cfg.live_blur && self.cfg.blur > 0 { 30 } else { 100 };
+        self.set_timer(if moving { 16 } else { idle });
     }
 
     /// Hover stays on while the mouse is anywhere over the fanned stack, gaps included.
@@ -505,12 +534,15 @@ impl MacNotif {
 
     /// Moves every card toward its target. Returns true while anything is still moving.
     fn step(&mut self, dt: f32) -> bool {
-        let k = 1.0 - (-dt / 0.075).exp();
-        let ke = 1.0 - (-dt / 0.09).exp();
-        let targets = self.targets();
+        let k = 1.0 - (-dt / 0.045).exp();
+        let ke = 1.0 - (-dt / 0.055).exp();
+        let mut by_card: Vec<Option<Target>> = vec![None; self.cards.len()];
+        for (i, t) in self.targets() {
+            by_card[i] = Some(t);
+        }
         let mut moving = false;
         for (i, c) in self.cards.iter_mut().enumerate() {
-            let t = targets.iter().find(|(k, _)| *k == i).map(|(_, t)| *t);
+            let t = by_card[i];
             let (tg, th, ts, ta) = match t {
                 Some(t) => {
                     c.slab = t.slab;
@@ -519,12 +551,25 @@ impl MacNotif {
                 None => (c.g, c.h, c.s, 0.0),
             };
             let te = if c.leaving { 0.0 } else { 1.0 };
+            // A card coming into view starts tucked behind its group's front card, not out of nowhere.
+            if let Some(t) = t {
+                if c.a < 0.02 && ta > 0.02 && !c.leaving && c.e > 0.9 {
+                    c.g = t.fr.0;
+                    c.h = t.fr.1;
+                    c.s = t.fr.2 * 0.92;
+                }
+            }
             c.g += (tg - c.g) * k;
             c.h += (th - c.h) * k;
             c.s += (ts - c.s) * k;
             c.a += (ta - c.a) * k;
             c.e += (te - c.e) * ke;
-            moving |= (tg - c.g).abs() > 0.3 || (ts - c.s).abs() > 0.004 || (ta - c.a).abs() > 0.01 || (te - c.e).abs() > 0.01;
+            if (tg - c.g).abs() > 0.3 || (ts - c.s).abs() > 0.004 || (ta - c.a).abs() > 0.01 || (te - c.e).abs() > 0.01 {
+                moving = true;
+            } else {
+                // Close enough: land exactly so the animation ends instead of crawling.
+                (c.g, c.h, c.s, c.a, c.e) = (tg, th, ts, ta, te);
+            }
         }
         moving
     }
@@ -533,7 +578,11 @@ impl MacNotif {
         let geo = self.geo();
         let live = self.order();
         // Rounded up in steps so the bitmap isn't reallocated every frame as the stack grows.
-        let scene_h = ((self.cards.iter().map(|c| c.g + c.h).fold(TOP + CARD_H, f32::max) + 40.0) / 64.0).ceil() * 64.0;
+        // Sized for where the cards are going and never shrunk while visible, so the window (and its
+        // blurred backdrop) isn't rebuilt mid-animation.
+        let want_h = self.targets().iter().map(|(_, t)| t.g + t.h).chain(self.cards.iter().map(|c| c.g + c.h)).fold(TOP + CARD_H, f32::max);
+        let scene_h = (((want_h + 40.0) / 128.0).ceil() * 128.0).max(self.scene_floor);
+        self.scene_floor = scene_h;
         self.scene_h = scene_h;
         let scene_w = geo.w + PAD * 2.0;
         // A real blurred backdrop lets the tint go lighter; without one the card has to stay readable.
@@ -569,16 +618,21 @@ impl MacNotif {
             let white = |a: f32| [1.0, 1.0, 1.0, a * alpha];
             // Icon tile: the app's own icon if there is one, else its initial on a colour.
             let (tx, ty) = (x + 14.0, y + 14.0);
-            items.push(Item::Rect { x: tx, y: ty, w: 36.0, h: 36.0, radius: 9.0, fill: [c.tile[0], c.tile[1], c.tile[2], if c.icon.is_empty() { alpha } else { 0.18 * alpha }], stroke: [0.0; 4], stroke_width: 0.0 });
+            let isz = self.cfg.icon_size as f32;
+            let bg = c.icon.is_empty() || self.cfg.icon_bg;
+            if bg {
+                items.push(Item::Rect { x: tx, y: ty, w: isz, h: isz, radius: isz * 0.25, fill: [c.tile[0], c.tile[1], c.tile[2], if c.icon.is_empty() { alpha } else { 0.18 * alpha }], stroke: [0.0; 4], stroke_width: 0.0 });
+            }
             if c.icon.is_empty() {
-                let st = style(17.0, 700);
+                let st = style(isz * 0.47, 700);
                 let initial: String = c.app.chars().next().unwrap_or('N').to_uppercase().collect();
                 let (iw, ih) = self.fonts.measure(&initial, &st);
-                items.push(Item::Text { text: initial, style: st, color: white(1.0), x: tx + (36.0 - iw) / 2.0, y: ty + (36.0 - ih) / 2.0, stretch: 1.0 });
+                items.push(Item::Text { text: initial, style: st, color: white(1.0), x: tx + (isz - iw) / 2.0, y: ty + (isz - ih) / 2.0, stretch: 1.0 });
             } else {
-                items.push(Item::Image { path: c.icon.clone(), x: tx + 3.0, y: ty + 3.0, w: 30.0, h: 30.0, alpha, tint: [1.0; 4] });
+                let inset = if bg { isz / 12.0 } else { 0.0 };
+                items.push(Item::Image { path: c.icon.clone(), x: tx + inset, y: ty + inset, w: isz - inset * 2.0, h: isz - inset * 2.0, alpha, tint: [1.0; 4] });
             }
-            let tx = x + 60.0;
+            let tx = x + 24.0 + isz;
             items.push(Item::Text { text: c.app.to_uppercase(), style: style(10.5, 600), color: white(0.72), x: tx, y: y + 11.0, stretch: 1.0 });
             if hover_idx == Some(i) {
                 items.push(Item::Rect { x: x + w - 28.0, y: y + 8.0, w: 18.0, h: 18.0, radius: 9.0, fill: white(0.16), stroke: [0.0; 4], stroke_width: 0.0 });
@@ -631,7 +685,7 @@ impl MacNotif {
     fn render(&mut self) {
         let mut scene = self.build();
         let scale = self.scale;
-        let wa = work_area();
+        let wa = work_area(HMONITOR(self.mon as _));
         let (w, h) = crate::gfx::physical_size(&scene, scale);
         let m = (self.cfg.margin as f32 * scale).round() as i32;
         let pad = (PAD * scale).round() as i32;
@@ -646,6 +700,7 @@ impl MacNotif {
             self.bd_key = if bd.is_some() { want } else { None };
             self.surface.set_backdrop(bd);
             self.bd_stale = false;
+            self.bd_at = Instant::now();
             if self.bd_key.is_some() != (self.cfg.blur > 0 && !scene.items.iter().all(|i| !matches!(i, Item::Glass { .. }))) {
                 scene = self.build();
             }
@@ -666,6 +721,7 @@ impl MacNotif {
 
     fn hide(&mut self) {
         self.bd_stale = true;
+        self.scene_floor = 0.0;
         if self.shown {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -717,8 +773,8 @@ fn style(size: f32, weight: u32) -> TextStyle {
 }
 
 /// Fits the title on one line and the text on up to two, with "…" where it runs out.
-fn wrap(fonts: &mut Fonts, title: &str, text: &str, card_w: f32) -> (String, Vec<String>) {
-    let avail = card_w - 74.0;
+fn wrap(fonts: &mut Fonts, title: &str, text: &str, card_w: f32, icon: f32) -> (String, Vec<String>) {
+    let avail = card_w - (icon + 38.0);
     let title = fit(fonts, title, &style(14.0, 700), avail);
     let st = style(12.5, 400);
     let mut lines: Vec<String> = Vec::new();
@@ -817,9 +873,26 @@ fn capture_backdrop(k: (i32, i32, u32, u32, u32, u32), scale: f32) -> Option<Bac
     }
 }
 
-fn dpi_scale() -> f32 {
+fn pick_monitor(mode: &str) -> HMONITOR {
     unsafe {
-        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let origin = POINT { x: 0, y: 0 };
+        match mode {
+            "cursor" => {
+                let mut p = origin;
+                let _ = GetCursorPos(&mut p);
+                MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY)
+            }
+            "active" => {
+                let fg = GetForegroundWindow();
+                if fg.0.is_null() { MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY) } else { MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY) }
+            }
+            _ => MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY),
+        }
+    }
+}
+
+fn dpi_scale(mon: HMONITOR) -> f32 {
+    unsafe {
         let (mut x, mut y) = (96u32, 96u32);
         if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_ok() && x >= 48 {
             x as f32 / 96.0
@@ -829,9 +902,8 @@ fn dpi_scale() -> f32 {
     }
 }
 
-fn work_area() -> RECT {
+fn work_area(mon: HMONITOR) -> RECT {
     unsafe {
-        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if GetMonitorInfoW(mon, &mut info).as_bool() {
             info.rcWork
