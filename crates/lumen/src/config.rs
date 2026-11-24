@@ -19,6 +19,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub taskbar: TaskbarConfig,
     pub island: IslandConfig,
+    pub macnotif: MacNotifConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,83 @@ pub struct Modules {
     pub launcher: bool,
     pub taskbar: bool,
     pub island: bool,
+    pub macnotif: bool,
+}
+
+/// MacNotif: Mac-style notification stack in a screen corner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MacNotifConfig {
+    /// "tl", "tr", "bl" or "br".
+    pub corner: String,
+    /// "stack" (piled, fans out on hover) or "tile" (always a list).
+    pub mode: String,
+    /// "new" puts the newest at the corner, "old" the oldest.
+    pub order: String,
+    pub max_shown: u32,
+    /// Seconds before a card goes away; 0 keeps it until clicked.
+    pub timeout_s: u32,
+    pub width: u32,
+    pub gap: u32,
+    pub margin: u32,
+    /// Backdrop blur radius in px, 0 = no backdrop (flat tint).
+    pub blur: u32,
+    /// Backdrop colour saturation in %, 50-250.
+    pub saturation: u32,
+    /// Glass tint strength, percent.
+    pub tint: u32,
+    pub radius: u32,
+    /// Keep showing while a fullscreen app or game is in front.
+    pub over_fullscreen: bool,
+    /// Stay quiet while Windows Focus / Do not disturb is on.
+    pub respect_focus: bool,
+    /// Turn Windows' own toasts off while the module runs (restored when it stops).
+    pub block_windows: bool,
+}
+
+impl Default for MacNotifConfig {
+    fn default() -> Self {
+        Self {
+            corner: "tr".into(),
+            mode: "stack".into(),
+            order: "new".into(),
+            max_shown: 4,
+            timeout_s: 6,
+            width: 360,
+            gap: 10,
+            margin: 16,
+            blur: 22,
+            saturation: 150,
+            tint: 55,
+            radius: 20,
+            over_fullscreen: false,
+            respect_focus: true,
+            block_windows: true,
+        }
+    }
+}
+
+impl MacNotifConfig {
+    pub fn clamp(&mut self) {
+        if !["tl", "tr", "bl", "br"].contains(&self.corner.as_str()) {
+            self.corner = "tr".into();
+        }
+        if !["stack", "tile"].contains(&self.mode.as_str()) {
+            self.mode = "stack".into();
+        }
+        if !["new", "old"].contains(&self.order.as_str()) {
+            self.order = "new".into();
+        }
+        self.max_shown = self.max_shown.clamp(1, 8);
+        self.timeout_s = self.timeout_s.min(15);
+        self.width = self.width.clamp(300, 440);
+        self.gap = self.gap.clamp(4, 24);
+        self.margin = self.margin.clamp(8, 48);
+        self.blur = self.blur.min(60);
+        self.saturation = self.saturation.clamp(50, 250);
+        self.tint = self.tint.clamp(20, 95);
+        self.radius = self.radius.clamp(8, 30);
+    }
 }
 
 /// The clipboard + media island docked to a screen edge.
@@ -294,13 +372,14 @@ impl Default for Config {
             appearance: Appearance::default(),
             taskbar: TaskbarConfig::default(),
             island: IslandConfig::default(),
+            macnotif: MacNotifConfig::default(),
         }
     }
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Self { clock: true, launcher: true, taskbar: false, island: false }
+        Self { clock: true, launcher: true, taskbar: false, island: false, macnotif: false }
     }
 }
 
@@ -451,6 +530,7 @@ impl Config {
                 Ok(mut cfg) => {
                     cfg.launcher.fill_defaults();
                     cfg.island.clamp();
+                    cfg.macnotif.clamp();
                     cfg.migrate_skins(&text);
                     cfg
                 }

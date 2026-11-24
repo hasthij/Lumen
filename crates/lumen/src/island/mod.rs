@@ -369,7 +369,7 @@ fn hsl(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 }
 
 /// Three box-blur passes (radius 2) each way, then saturation, on BGRA; output is opaque.
-fn blur_sat(px: &mut [u8], w: usize, h: usize, sat: f32) {
+pub(crate) fn blur_sat(px: &mut [u8], w: usize, h: usize, sat: f32) {
     fn pass(src: &[u8], dst: &mut [u8], w: usize, h: usize, horiz: bool) {
         let (n, m) = if horiz { (h, w) } else { (w, h) };
         for line in 0..n {

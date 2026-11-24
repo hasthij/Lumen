@@ -37,6 +37,7 @@ pub enum Page {
     Skins,
     Launcher,
     Island,
+    MacNotif,
     Taskbar,
     About,
 }
@@ -47,7 +48,8 @@ const PAGES: &[(Page, &str, char)] = &[
     (Page::Skins, "Skins", '\u{E8B7}'),
     (Page::Launcher, "Launcher", '\u{E721}'),
     (Page::Island, "Island", '\u{E7F4}'),
-    (Page::Taskbar, "Taskbar", '\u{E7C4}'),
+    (Page::MacNotif, "Notifications", '\u{EA8F}'),
+    (Page::Taskbar, "Taskbar",'\u{E7C4}'),
     (Page::About, "About", '\u{E946}'),
 ];
 
@@ -94,6 +96,15 @@ enum Slider {
     IslandHue,
     ClockHue,
     ClockSat,
+    MnMax,
+    MnTimeout,
+    MnWidth,
+    MnGap,
+    MnMargin,
+    MnBlur,
+    MnSat,
+    MnTint,
+    MnRadius,
     TbOpacity(Sit),
     TbHue(Sit),
     TbLight(Sit),
@@ -132,6 +143,14 @@ enum Hit {
     IslandCoverColors,
     IslandGrain,
     IslandSheen,
+    MnCorner(&'static str),
+    MnMode(&'static str),
+    MnOrder(&'static str),
+    MnFullscreen,
+    MnFocus,
+    MnBlockWin,
+    MnTest,
+    MnTestApp(u8),
     Engine(&'static str),
     Slider(Slider, Rect),
     Theme(&'static str),
@@ -165,6 +184,9 @@ pub enum Change {
     QuitTranslucentTB,
     RestoreTaskbar,
     RestartExplorer,
+    /// Post a sample notification.
+    MacNotifTest,
+    MacNotifAppTest(u8),
 }
 
 /// Live facts the app reports to the settings window.
@@ -403,6 +425,15 @@ impl Settings {
             Slider::IslandHistory => (self.cfg.island.history_days as f32 - 1.0) / 29.0,
             Slider::ClockHue => hsv_of(&self.sel().color, [1.0; 3]).0 / 360.0,
             Slider::ClockSat => hsv_of(&self.sel().color, [1.0; 3]).1,
+            Slider::MnMax => (self.cfg.macnotif.max_shown as f32 - 1.0) / 7.0,
+            Slider::MnTimeout => self.cfg.macnotif.timeout_s as f32 / 15.0,
+            Slider::MnWidth => (self.cfg.macnotif.width as f32 - 300.0) / 140.0,
+            Slider::MnGap => (self.cfg.macnotif.gap as f32 - 4.0) / 20.0,
+            Slider::MnMargin => (self.cfg.macnotif.margin as f32 - 8.0) / 40.0,
+            Slider::MnBlur => self.cfg.macnotif.blur as f32 / 60.0,
+            Slider::MnSat => (self.cfg.macnotif.saturation as f32 - 50.0) / 200.0,
+            Slider::MnTint => (self.cfg.macnotif.tint as f32 - 20.0) / 75.0,
+            Slider::MnRadius => (self.cfg.macnotif.radius as f32 - 8.0) / 22.0,
             Slider::TbOpacity(s) => self.look(s).opacity,
             Slider::TbHue(s) => hsv_of(&self.look(s).color, [0.0; 3]).0 / 360.0,
             Slider::TbLight(s) => hsv_of(&self.look(s).color, [0.0; 3]).2,
@@ -457,6 +488,15 @@ impl Settings {
                     c.color = theme::to_hex(theme::hsv(h, sat, 1.0));
                 }
             }
+            Slider::MnMax => self.cfg.macnotif.max_shown = (1.0 + t * 7.0).round() as u32,
+            Slider::MnTimeout => self.cfg.macnotif.timeout_s = (t * 15.0).round() as u32,
+            Slider::MnWidth => self.cfg.macnotif.width = (((300.0 + t * 140.0) / 10.0).round() * 10.0) as u32,
+            Slider::MnGap => self.cfg.macnotif.gap = (4.0 + t * 20.0).round() as u32,
+            Slider::MnMargin => self.cfg.macnotif.margin = (8.0 + t * 40.0).round() as u32,
+            Slider::MnBlur => self.cfg.macnotif.blur = (t * 60.0).round() as u32,
+            Slider::MnSat => self.cfg.macnotif.saturation = (50.0 + t * 200.0).round() as u32,
+            Slider::MnTint => self.cfg.macnotif.tint = (20.0 + t * 75.0).round() as u32,
+            Slider::MnRadius => self.cfg.macnotif.radius = (8.0 + t * 22.0).round() as u32,
             Slider::TbOpacity(sit) => self.look_mut(sit).opacity = (t * 100.0).round() / 100.0,
             Slider::TbHue(sit) | Slider::TbLight(sit) => {
                 let (h, _, v) = hsv_of(&self.look(sit).color, [0.0; 3]);
@@ -484,6 +524,16 @@ impl Settings {
             Slider::IslandRadius => format!("{} px", self.cfg.island.radius),
             Slider::IslandFontSize => format!("{} pt", self.cfg.island.font_size),
             Slider::IslandHue => "Hue".into(),
+            Slider::MnMax => format!("{}", self.cfg.macnotif.max_shown),
+            Slider::MnTimeout if self.cfg.macnotif.timeout_s == 0 => "Sticky".into(),
+            Slider::MnTimeout => format!("{} s", self.cfg.macnotif.timeout_s),
+            Slider::MnWidth => format!("{} px", self.cfg.macnotif.width),
+            Slider::MnGap => format!("{} px", self.cfg.macnotif.gap),
+            Slider::MnMargin => format!("{} px", self.cfg.macnotif.margin),
+            Slider::MnBlur => if self.cfg.macnotif.blur == 0 { "Off".to_string() } else { format!("{} px", self.cfg.macnotif.blur) },
+            Slider::MnSat => format!("{}%", self.cfg.macnotif.saturation),
+            Slider::MnTint => format!("{}%", self.cfg.macnotif.tint),
+            Slider::MnRadius => format!("{} px", self.cfg.macnotif.radius),
             Slider::TbOpacity(sit) => format!("{}%", (self.look(sit).opacity * 100.0).round()),
             Slider::TintHue | Slider::ClockHue | Slider::TbHue(_) => "Hue".into(),
             Slider::TintLight | Slider::TbLight(_) => "Brightness".into(),
@@ -529,10 +579,37 @@ impl Settings {
                     "launcher" => self.cfg.modules.launcher = !self.cfg.modules.launcher,
                     "taskbar" => self.cfg.modules.taskbar = !self.cfg.modules.taskbar,
                     "island" => self.cfg.modules.island = !self.cfg.modules.island,
+                    "macnotif" => self.cfg.modules.macnotif = !self.cfg.modules.macnotif,
                     _ => {}
                 }
                 self.commit_config();
             }
+            Hit::MnCorner(c) => {
+                self.cfg.macnotif.corner = c.into();
+                self.commit_config();
+            }
+            Hit::MnMode(m) => {
+                self.cfg.macnotif.mode = m.into();
+                self.commit_config();
+            }
+            Hit::MnOrder(o) => {
+                self.cfg.macnotif.order = o.into();
+                self.commit_config();
+            }
+            Hit::MnFullscreen => {
+                self.cfg.macnotif.over_fullscreen = !self.cfg.macnotif.over_fullscreen;
+                self.commit_config();
+            }
+            Hit::MnFocus => {
+                self.cfg.macnotif.respect_focus = !self.cfg.macnotif.respect_focus;
+                self.commit_config();
+            }
+            Hit::MnBlockWin => {
+                self.cfg.macnotif.block_windows = !self.cfg.macnotif.block_windows;
+                self.commit_config();
+            }
+            Hit::MnTest => self.changes.push(Change::MacNotifTest),
+            Hit::MnTestApp(k) => self.changes.push(Change::MacNotifAppTest(k)),
             Hit::IslandSide(id) => {
                 self.cfg.island.side = id.into();
                 self.commit_config();
@@ -1061,6 +1138,7 @@ impl Settings {
             Page::Skins => ("Skins", "Choose which Rainmeter skins stay on your desktop"),
             Page::Launcher => ("Launcher", "Search apps, files, settings and more"),
             Page::Island => ("Island", "Clipboard history and media, docked to a screen edge"),
+            Page::MacNotif => ("Notifications", "macOS-style notification stack, in any corner"),
             Page::Taskbar => ("Taskbar", "Clear or tinted taskbar, by situation"),
             Page::About => ("About", "Lumen"),
         };
@@ -1083,6 +1161,7 @@ impl Settings {
             Page::Skins => self.page_skins(top),
             Page::Launcher => self.page_launcher(top),
             Page::Island => self.page_island(top),
+            Page::MacNotif => self.page_macnotif(top),
             Page::Taskbar => self.page_taskbar(top),
             Page::About => self.page_about(top),
         };
@@ -1271,11 +1350,12 @@ impl Settings {
         y += 68.0 + 24.0;
 
         y = self.section("Modules", y);
-        let modules: [(&'static str, char, &str, &str, bool); 4] = [
+        let modules: [(&'static str, char, &str, &str, bool); 5] = [
             ("clock", '\u{E8B7}', "Skins", "Rainmeter skins on your desktop", self.cfg.modules.clock),
             ("launcher", '\u{E721}', "Launcher", "PowerToys Run replacement", self.cfg.modules.launcher),
             ("island", '\u{E7F4}', "Island", "Clipboard history and media dock", self.cfg.modules.island),
-            ("taskbar", '\u{E7C4}', "Clear taskbar", "TranslucentTB replacement", self.cfg.modules.taskbar),
+            ("macnotif", '\u{EA8F}', "Notifications", "macOS-style notification stack", self.cfg.modules.macnotif),
+            ("taskbar", '\u{E7C4}', "Clear taskbar","TranslucentTB replacement", self.cfg.modules.taskbar),
         ];
         for (id, g, name, desc, on) in modules {
             self.card(y, 68.0, Some((g, None)), name, desc);
@@ -1625,6 +1705,84 @@ impl Settings {
             x += 34.0;
         }
         y + 108.0
+    }
+
+    fn page_macnotif(&mut self, mut y: f32) -> f32 {
+        let right = RIGHT;
+        let mn = self.cfg.macnotif.clone();
+        y = self.section("Notifications", y);
+        self.card(y, 68.0, Some(('\u{EA8F}', None)), "Notifications", "Lumen's own notification stack; send one with lumen --notify");
+        self.toggle(right, y + 34.0, self.cfg.modules.macnotif, Hit::Module("macnotif"), true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E9D5}', None)), "Try it", "Posts a sample notification from a few apps");
+        self.button(right, y + 34.0, "Send test", Hit::MnTest);
+        y += 72.0;
+        for (k, name, sub) in [
+            (0u8, "Test as Discord", "Real Windows toast from Discord: banner hidden; the real Discord app plays its own sound, a fake toast cannot"),
+            (1, "Test as Telegram", "Real Windows toast from Telegram: banner hidden; the real Telegram app plays its own sound, a fake toast cannot"),
+            (2, "Test as other app", "Real Windows toast from an app with no sound of its own: plays the native Windows sound"),
+        ] {
+            self.card(y, 68.0, Some(('\u{E9D5}', None)), name, sub);
+            self.button(right, y + 34.0, "Send", Hit::MnTestApp(k));
+            y += 72.0;
+        }
+        self.card(y, 68.0, Some(('\u{E7FC}', None)), "Over fullscreen", "Keep showing while a fullscreen app or game is in front");
+        self.toggle(right, y + 34.0, mn.over_fullscreen, Hit::MnFullscreen, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E7FC}', None)), "Respect Focus mode", "Hold notifications while Windows Focus / Do not disturb is on");
+        self.toggle(right, y + 34.0, mn.respect_focus, Hit::MnFocus, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E7FC}', None)), "Hide Windows notifications", "Turns every Windows toast off (all apps, Defender too) while this module is on");
+        self.toggle(right, y + 34.0, mn.block_windows, Hit::MnBlockWin, true);
+        y += 72.0;
+        y += 20.0;
+
+        y = self.section("Layout", y);
+        self.card(y, 68.0, Some(('\u{E7C9}', None)), "Corner", "Which screen corner the stack grows from");
+        let corners: [(&'static str, &str); 4] = [("tl", "Top left"), ("tr", "Top right"), ("bl", "Bottom left"), ("br", "Bottom right")];
+        let opts: Vec<(&str, Hit)> = corners.iter().map(|(id, n)| (*n, Hit::MnCorner(id))).collect();
+        let sel = corners.iter().position(|(id, _)| *id == mn.corner).unwrap_or(1);
+        self.segmented(right, y + 34.0, &opts, sel);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E8FD}', None)), "Style", "Stack piles them up and fans out on hover; Tile lists them all");
+        let opts = [("Stack", Hit::MnMode("stack")), ("Tile", Hit::MnMode("tile"))];
+        self.segmented(right, y + 34.0, &opts, if mn.mode == "tile" { 1 } else { 0 });
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E8CB}', None)), "Order", "Which notification sits at the corner");
+        let opts = [("Newest first", Hit::MnOrder("new")), ("Oldest first", Hit::MnOrder("old"))];
+        self.segmented(right, y + 34.0, &opts, if mn.order == "old" { 1 } else { 0 });
+        y += 72.0;
+        let rows: [(char, &str, &str, Slider); 6] = [
+            ('\u{E8FD}', "Shown at once", "More than this collapses into a +N pill", Slider::MnMax),
+            ('\u{E916}', "Stay time", "Seconds before a card goes away; 0 keeps it until clicked", Slider::MnTimeout),
+            ('\u{E740}', "Width", "Width of each card", Slider::MnWidth),
+            ('\u{E8A0}', "Gap", "Space between cards when tiled or fanned out", Slider::MnGap),
+            ('\u{E7B3}', "Screen margin", "Distance from the screen edge", Slider::MnMargin),
+            ('\u{E71A}', "Corner radius", "Roundness of each card", Slider::MnRadius),
+        ];
+        for (g, t, d, s) in rows {
+            self.card(y, 68.0, Some((g, None)), t, d);
+            let v = self.slider_label(s);
+            self.slider(RIGHT - 366.0, y + 34.0, 300.0, s, None);
+            self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+            y += 72.0;
+        }
+        y += 20.0;
+
+        y = self.section("Glass", y);
+        let rows: [(char, &str, &str, Slider); 3] = [
+            ('\u{E727}', "Blur", "How much the screen behind a card is blurred; 0 is a flat tint", Slider::MnBlur),
+            ('\u{E790}', "Colour boost", "Saturation of the blurred backdrop", Slider::MnSat),
+            ('\u{E793}', "Tint amount", "How much dark tint covers the glass", Slider::MnTint),
+        ];
+        for (g, t, d, s) in rows {
+            self.card(y, 68.0, Some((g, None)), t, d);
+            let v = self.slider_label(s);
+            self.slider(RIGHT - 366.0, y + 34.0, 300.0, s, None);
+            self.canvas.text(&v, Rect::new(RIGHT - 58.0, y + 16.0, 58.0, 36.0), Font::Text, 13.0, 500, white(0.9), Align::Right);
+            y += 72.0;
+        }
+        y - 4.0
     }
 
     fn page_launcher(&mut self, mut y: f32) -> f32 {

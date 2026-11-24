@@ -13,6 +13,7 @@ mod gfx;
 mod icon;
 mod island;
 mod launcher;
+mod macnotif;
 #[macro_use]
 mod log;
 mod rainmeter;
@@ -20,6 +21,7 @@ mod settings;
 mod taskbar;
 mod theme;
 mod update;
+mod winnotif;
 
 use windows::core::w;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
@@ -57,6 +59,26 @@ fn main() {
         };
         std::process::exit(code);
     }
+    // `--macnotif-snapshot <count> <hover 0|1> <out.bmp>`: sample notifications, settled.
+    if let Some(i) = args.iter().position(|a| a == "--macnotif-snapshot") {
+        let count = args.get(i + 1).and_then(|a| a.parse().ok()).unwrap_or(3);
+        let hover = args.get(i + 2).is_some_and(|a| a == "1");
+        let out = args.get(i + 3).cloned().unwrap_or_else(|| "macnotif.bmp".into());
+        let cfg = config::Config::load();
+        let Ok(mut m) = macnotif::MacNotif::create(&cfg.macnotif) else { std::process::exit(1) };
+        let code = match m.snapshot(count, hover) {
+            Some((w, h, px)) => write_bmp(&out, w, h, &px),
+            None => 2,
+        };
+        std::process::exit(code);
+    }
+    // `lumen --notify "title" "text" [--app <exe|name>] [--url <link>]`: show a notification in the running Lumen.
+    if let Some(i) = args.iter().position(|a| a == "--notify") {
+        let opt = |name: &str| args.iter().position(|a| a == name).and_then(|j| args.get(j + 1)).cloned().unwrap_or_default();
+        let title = args.get(i + 1).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+        let text = args.get(i + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+        std::process::exit(send_notice(&title, &text, &opt("--app"), &opt("--url")));
+    }
     if let Some(i) = args.iter().position(|a| a == "--query") {
         let q = args.get(i + 1).cloned().unwrap_or_default();
         let cfg = config::Config::load();
@@ -71,6 +93,7 @@ fn main() {
             Some("clock") | Some("skins") => settings::Page::Skins,
             Some("appearance") => settings::Page::Appearance,
             Some("island") => settings::Page::Island,
+            Some("macnotif") | Some("notifications") => settings::Page::MacNotif,
             Some("taskbar") => settings::Page::Taskbar,
             Some("launcher") => settings::Page::Launcher,
             Some("about") => settings::Page::About,
@@ -163,6 +186,32 @@ fn main() {
         }
         info!("Lumen exited");
     }
+}
+
+/// Hands a notification to the running Lumen (exit 0), or reports that it isn't running.
+fn send_notice(title: &str, text: &str, exe: &str, url: &str) -> i32 {
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
+    let clean = |s: &str| s.replace('\u{1f}', " ");
+    let payload = [clean(title), clean(text), String::new(), clean(exe), clean(url)].join("\u{1f}");
+    if payload.len() >= 16_384 {
+        eprintln!("Notification is too long.");
+        return 1;
+    }
+    let cds = COPYDATASTRUCT { dwData: app::NOTIFY_MAGIC, cbData: payload.len() as u32, lpData: payload.as_ptr() as *mut _ };
+    unsafe {
+        let Ok(hwnd) = FindWindowW(w!("LumenApp"), None) else {
+            eprintln!("Lumen is not running.");
+            return 1;
+        };
+        let mut result = 0usize;
+        let sent = SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 2000, Some(&mut result));
+        if sent.0 == 0 || result == 0 {
+            eprintln!("Lumen did not take the notification. Is the Notifications module on?");
+            return 1;
+        }
+    }
+    0
 }
 
 fn launcher_snapshot(q: &str, out: &str) -> i32 {

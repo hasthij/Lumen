@@ -17,6 +17,7 @@ use crate::config::ClockConfig;
 use crate::config::Config;
 use crate::island::Island;
 use crate::launcher::Launcher;
+use crate::macnotif::{MacNotif, Notice};
 use crate::settings::{Change, Settings, Status};
 use crate::taskbar::{Taskbar, WM_TASKBAR_EVENT};
 
@@ -31,6 +32,10 @@ pub const WM_CLOCK_MOVED: u32 = WM_APP + 4;
 pub const WM_RESTORE_TASKBAR: u32 = WM_APP + 5;
 /// Posted by the foreground watcher whenever the active window changes.
 const WM_FOREGROUND: u32 = WM_APP + 6;
+/// Posted when the tray menu or settings asks for a sample notification.
+pub const WM_MACNOTIF_TEST: u32 = WM_APP + 7;
+/// Tag on the WM_COPYDATA that carries a notification.
+pub const NOTIFY_MAGIC: usize = 0x4C4E_4F54;
 static APP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 /// Ask GitHub for a newer release; `manual` also reports "up to date" and errors.
@@ -90,7 +95,7 @@ fn desktop_in_front() -> Option<bool> {
             // foreground window; it must not count as "an app is in front", or the clock
             // would drop behind the desktop while the menu is open.
             c if c.starts_with('#') => None,
-            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "ForegroundStaging" | "LumenLauncher" | "LumenIsland" | "LumenSettings" | "LumenApp" | "" => None,
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "ForegroundStaging" | "LumenLauncher" | "LumenIsland" | "LumenMacNotif" | "LumenSettings" | "LumenApp" | "" => None,
             _ => {
                 // Tool windows, tooltips and similar helpers aren't apps either.
                 let ex = GetWindowLongPtrW(fg, GWL_EXSTYLE) as u32;
@@ -116,6 +121,7 @@ const CMD_RESTORE_TASKBAR: usize = 108;
 const CMD_OPEN_CONFIG: usize = 102;
 const CMD_OPEN_LOG: usize = 103;
 const CMD_ISLAND: usize = 109;
+const CMD_MACNOTIF: usize = 110;
 const CMD_QUIT: usize = 199;
 
 thread_local! {
@@ -129,6 +135,7 @@ pub struct App {
     skins: Vec<Clock>,
     launcher: Option<Launcher>,
     island: Option<Island>,
+    macnotif: Option<MacNotif>,
     settings: Option<Settings>,
     taskbar: Option<Taskbar>,
     /// Why the taskbar module last stopped on its own, shown in settings.
@@ -149,7 +156,7 @@ pub fn run(open_settings: bool) -> Result<()> {
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
     };
     let cfg = Config::load();
-    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, island: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
+    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, island: None, macnotif: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| {
         app.add_tray();
@@ -183,6 +190,11 @@ pub fn launcher_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
 /// Messages for the island window, routed to the island module if it is on.
 pub fn island_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     with_app(|app| app.island.as_mut().and_then(|i| i.handle(msg, wp, lp))).flatten()
+}
+
+/// Messages for the notification window, routed to MacNotif if it is on.
+pub fn macnotif_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    with_app(|app| app.macnotif.as_mut().and_then(|m| m.handle(msg, wp, lp))).flatten()
 }
 
 /// Messages for the settings window. Changes it makes are applied right after.
@@ -231,6 +243,20 @@ impl App {
             (false, true) => {
                 self.island = None;
                 crate::info!("island module off");
+            }
+            _ => {}
+        }
+        match (self.cfg.modules.macnotif, self.macnotif.is_some()) {
+            (true, false) => match MacNotif::create(&self.cfg.macnotif) {
+                Ok(m) => {
+                    self.macnotif = Some(m);
+                    crate::info!("macnotif module on");
+                }
+                Err(e) => crate::error!("macnotif module failed to start: {e}"),
+            },
+            (false, true) => {
+                self.macnotif = None;
+                crate::info!("macnotif module off");
             }
             _ => {}
         }
@@ -346,6 +372,9 @@ impl App {
         if let Some(i) = self.island.as_mut() {
             i.set_config(&self.cfg.island);
         }
+        if let Some(m) = self.macnotif.as_mut() {
+            m.set_config(&self.cfg.macnotif);
+        }
     }
 
     fn open_settings(&mut self) {
@@ -404,6 +433,12 @@ impl App {
                     }
                     self.clock_tick(true);
                 }
+                Change::MacNotifTest => {
+                    if let Some(m) = self.macnotif.as_mut() {
+                        m.post_sample();
+                    }
+                }
+                Change::MacNotifAppTest(k) => crate::winnotif::test_toast(k),
                 Change::RestoreTaskbar => self.restore_taskbar(),
                 Change::RestartExplorer => {
                     self.restore_taskbar();
@@ -529,6 +564,7 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.launcher), CMD_LAUNCHER, w!("Launcher"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.taskbar), CMD_TASKBAR, w!("Clear taskbar"));
             let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.island), CMD_ISLAND, w!("Island"));
+            let _ = AppendMenuW(menu, MF_STRING | check(self.cfg.modules.macnotif), CMD_MACNOTIF, w!("Notifications"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD, w!("Reload skin"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open settings file"));
@@ -570,6 +606,12 @@ impl App {
             }
             CMD_ISLAND => {
                 self.cfg.modules.island = !self.cfg.modules.island;
+                self.cfg.save();
+                self.apply_modules();
+                self.sync_settings();
+            }
+            CMD_MACNOTIF => {
+                self.cfg.modules.macnotif = !self.cfg.modules.macnotif;
                 self.cfg.save();
                 self.apply_modules();
                 self.sync_settings();
@@ -642,6 +684,27 @@ impl App {
                     for c in self.skins.iter_mut() {
                         c.set_desktop_in_front(front);
                     }
+                }
+                Some(LRESULT(0))
+            }
+            WM_COPYDATA => {
+                // `lumen --notify`: "titletextappexeurl" from another process.
+                let cds = unsafe { (lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT).as_ref() };
+                let mut posted = false;
+                if let (Some(cds), Some(m)) = (cds, self.macnotif.as_mut()) {
+                    if cds.dwData == NOTIFY_MAGIC && !cds.lpData.is_null() && cds.cbData < 16_384 {
+                        let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+                        let text = String::from_utf8_lossy(bytes);
+                        let mut f = text.split('').map(str::to_string);
+                        posted = true;
+                        m.post(Notice { title: f.next().unwrap_or_default(), text: f.next().unwrap_or_default(), app: f.next().unwrap_or_default(), exe: f.next().unwrap_or_default(), url: f.next().unwrap_or_default(), progress: None, image: String::new() });
+                    }
+                }
+                Some(LRESULT(posted as isize))
+            }
+            WM_MACNOTIF_TEST => {
+                if let Some(m) = self.macnotif.as_mut() {
+                    m.post_sample();
                 }
                 Some(LRESULT(0))
             }

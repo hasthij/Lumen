@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lumen Notifications Lab (0.6.0)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist:wght@500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Same dark lab chrome as lumen-lab.html. Stage = fake Windows desktop; the notification module is separate from the island. */
+:root{--bg:#0c0d10;--surface:#14161a;--line:#24272e;--text:#eceef2;--muted:#9097a3;--acc:hsl(205 85% 68%);
+  --display:"Geist","Segoe UI",system-ui,sans-serif;--body:"Inter","Segoe UI",system-ui,sans-serif;--mono:"Geist Mono",Consolas,monospace;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 var(--body)}
+button,select,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+header.top{padding:28px 32px 8px;max-width:1440px;margin:0 auto}
+header.top h1{font:600 26px/1.1 var(--display);margin:0;letter-spacing:-.02em;display:flex;gap:10px;align-items:center}
+header.top h1 em{font:500 12px var(--mono);font-style:normal;color:var(--acc);border:1px solid var(--line);border-radius:99px;padding:2px 9px}
+header.top p{margin:6px 0 0;color:var(--muted);max-width:74ch}
+.wrap{max-width:1440px;margin:0 auto;padding:12px 32px 48px}
+.lab{display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start}
+@media(max-width:900px){.lab{grid-template-columns:1fr}aside.ctl{position:static;max-height:none}.stage{order:-1}}
+aside.ctl{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:16px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;display:flex;flex-direction:column;gap:16px}
+aside.ctl h3{margin:0 0 8px;font:600 11px var(--display);letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.grp{display:flex;flex-direction:column;gap:8px}
+.seg{display:inline-flex;background:#0f1114;border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;flex-wrap:wrap}
+.seg button{border:0;background:transparent;padding:5px 10px;border-radius:7px;cursor:pointer;color:var(--muted);font-size:12px;transition:background .15s,color .15s}
+.seg button:hover{color:var(--text)}
+.seg button[aria-pressed="true"]{background:#2a2e36;color:var(--text)}
+.rng{display:grid;grid-template-columns:78px 1fr 40px;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.rng output{font:11px var(--mono);text-align:right;color:var(--text)}
+input[type=range]{accent-color:var(--acc);cursor:pointer;width:100%}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.btn{border:1px solid var(--line);background:#1b1e24;border-radius:9px;padding:7px 8px;cursor:pointer;font-size:12px;display:flex;gap:7px;align-items:center;transition:background .15s,border-color .15s;text-align:left}
+.btn:hover{background:#242830;border-color:#3a3f49}
+.btn.pri{background:var(--acc);color:#07121b;border-color:transparent;font-weight:600;justify-content:center}
+.btn.pri:hover{background:hsl(205 85% 74%)}
+.btn i{width:8px;height:8px;border-radius:50%;flex:none}
+/* corner picker */
+.corners{position:relative;width:100%;aspect-ratio:16/10;border-radius:10px;border:1px solid var(--line);background:#0f1114}
+.corners button{position:absolute;width:34%;height:34%;border:1px dashed #3a3f49;background:transparent;border-radius:8px;cursor:pointer;color:var(--muted);font:10px var(--mono);transition:all .15s}
+.corners button:hover{border-color:var(--acc);color:var(--text)}
+.corners button[aria-pressed="true"]{background:hsl(205 85% 68% / .18);border:1px solid var(--acc);color:var(--text)}
+.corners .tl{left:6px;top:6px}.corners .tr{right:6px;top:6px}.corners .bl{left:6px;bottom:6px}.corners .br{right:6px;bottom:6px}
+.spec{font-size:12px;color:var(--muted);margin:0;padding-left:16px;display:flex;flex-direction:column;gap:3px}
+.spec b{color:var(--text);font-weight:600}
+
+/* ---------- stage: fake desktop ---------- */
+.stage{position:relative;border-radius:22px;min-height:720px;overflow:hidden;border:1px solid var(--line);
+  background:radial-gradient(1200px 700px at 20% 10%,#3b5bdb55,transparent 60%),radial-gradient(900px 600px at 90% 80%,#e0359a44,transparent 60%),linear-gradient(135deg,#0f1b3d,#2a1650 55%,#4a1d4f)}
+.win{position:absolute;border-radius:12px;background:#1c1f26;border:1px solid #ffffff14;box-shadow:0 20px 60px -20px #000c;overflow:hidden}
+.win .tb{height:30px;background:#262a33;display:flex;align-items:center;gap:6px;padding:0 10px}
+.win .tb i{width:9px;height:9px;border-radius:50%;background:#ffffff30}
+.win .ln{height:8px;border-radius:4px;background:#ffffff14;margin:12px 14px}
+.w1{left:7%;top:14%;width:46%;height:46%}.w2{right:9%;top:30%;width:36%;height:44%;background:#e9ecf2}
+.w2 .tb{background:#d5d9e2}.w2 .tb i{background:#00000026}.w2 .ln{background:#00000014}
+.taskbar{position:absolute;left:0;right:0;bottom:0;height:46px;background:#10121acc;backdrop-filter:blur(20px);display:flex;justify-content:center;align-items:center;gap:8px;border-top:1px solid #ffffff12;z-index:1}
+.taskbar i{width:26px;height:26px;border-radius:7px;background:#ffffff22}
+.taskbar b{position:absolute;right:14px;font:500 11px var(--mono);color:#ffffffb0}
+.notch{position:absolute;top:0;left:50%;transform:translateX(-50%);width:210px;height:30px;border-radius:0 0 16px 16px;background:#0b0c0f;box-shadow:inset 0 -1px 0 #ffffff1c;z-index:1}
+.notch::after{content:"island";position:absolute;inset:0;display:grid;place-items:center;font:10px var(--mono);color:#ffffff66}
+.hint{position:absolute;left:16px;bottom:58px;font:11px var(--mono);color:#ffffffb0;text-shadow:0 1px 3px #0008;z-index:1}
+
+/* ---------- notification module ---------- */
+.nz{position:absolute;z-index:5;pointer-events:none;--w:360px}
+.nz.tl,.nz.tr{top:var(--m)}.nz.bl,.nz.br{bottom:var(--m)}
+.nz.tl,.nz.bl{left:var(--m)}.nz.tr,.nz.br{right:var(--m)}
+.nz.br,.nz.bl{bottom:calc(var(--m) + 46px)}               /* clear the taskbar */
+.nz.tl,.nz.tr{top:calc(var(--m) + 30px)}                    /* clear the island notch row */
+.nz-slot{position:absolute;width:var(--w);transition:transform .38s cubic-bezier(.22,1,.36,1),opacity .3s,filter .3s;pointer-events:auto;will-change:transform}
+.nz.tl .nz-slot,.nz.tr .nz-slot{top:0}.nz.bl .nz-slot,.nz.br .nz-slot{bottom:0}
+.nz.tl .nz-slot,.nz.bl .nz-slot{left:0}.nz.tr .nz-slot,.nz.br .nz-slot{right:0}
+.nz.tl .nz-slot,.nz.tr .nz-slot{transform-origin:50% 100%}.nz.bl .nz-slot,.nz.br .nz-slot{transform-origin:50% 0}
+.nz-card{position:relative;display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:var(--r,20px);color:#f4f6fa;
+  background:var(--tint);backdrop-filter:blur(var(--blur)) saturate(170%);-webkit-backdrop-filter:blur(var(--blur)) saturate(170%);
+  box-shadow:inset 0 1px 0 #ffffff2e,inset 0 0 0 1px #ffffff1c,0 18px 44px -14px #000b;animation:in .42s cubic-bezier(.22,1,.36,1) both}
+.nz.tr .nz-card,.nz.br .nz-card{--dx:130%}.nz.tl .nz-card,.nz.bl .nz-card{--dx:-130%}
+@keyframes in{from{transform:translateX(var(--dx));opacity:0}to{transform:none;opacity:1}}
+.nz-card.out{animation:out .28s cubic-bezier(.5,0,.9,.4) forwards}
+@keyframes out{to{transform:translateX(var(--dx));opacity:0}}
+.nz-ico{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;flex:none}
+.nz-ico svg{width:22px;height:22px;stroke:#fff;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.nz-body{min-width:0;flex:1}
+.nz-top{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#ffffffa8;letter-spacing:.02em}
+.nz-top b{font-weight:600;text-transform:uppercase;letter-spacing:.07em;font-size:10.5px}
+.nz-title{font:600 13.5px/1.3 var(--display);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nz-text{font-size:12.5px;color:#ffffffd0;line-height:1.4;margin-top:1px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.nz-prog{height:4px;border-radius:2px;background:#ffffff26;margin-top:8px;overflow:hidden}.nz-prog i{display:block;height:100%;background:#fff;border-radius:2px;transition:width .2s linear}
+.nz-act{display:flex;gap:6px;margin-top:8px}.nz-act button{border:0;border-radius:7px;padding:4px 10px;font-size:11.5px;font-weight:600;cursor:pointer;background:#ffffff26;color:#fff;transition:background .15s}.nz-act button:hover{background:#ffffff40}
+.nz-x{position:absolute;top:-7px;left:-7px;width:22px;height:22px;border-radius:50%;border:0;background:#2a2e36;color:#fff;cursor:pointer;display:grid;place-items:center;opacity:0;transition:opacity .15s;box-shadow:0 2px 8px #0008;padding:0}
+.nz.tr .nz-x,.nz.br .nz-x{left:-7px}.nz.tl .nz-x,.nz.bl .nz-x{left:auto;right:-7px}
+.nz-x svg{width:11px;height:11px;stroke:#fff;stroke-width:2.4;fill:none;stroke-linecap:round}
+.nz:hover .nz-slot.front .nz-x,.nz.open .nz-x{opacity:1}
+.nz-slot.behind .nz-card{pointer-events:none}
+.nz-slot.behind .nz-card>*{opacity:0;transition:opacity .2s}      /* back cards read as plain glass slabs */
+.nz-slot.behind .nz-card{background:rgba(52,57,70,.78);box-shadow:inset 0 1px 0 #ffffff40,inset 0 0 0 1px #ffffff2a,0 8px 20px -8px #000a}
+.nz-timer{position:absolute;left:14px;right:14px;bottom:0;height:2px;border-radius:2px;background:#ffffff40;transform-origin:left;pointer-events:none}
+.nz-more{position:absolute;pointer-events:auto;font:600 11px var(--display);padding:4px 11px;border-radius:99px;background:#16181ccc;backdrop-filter:blur(12px);color:#fff;box-shadow:inset 0 0 0 1px #ffffff22;white-space:nowrap;cursor:pointer;border:0;transition:transform .38s cubic-bezier(.22,1,.36,1),opacity .2s}
+.nz-clear{position:absolute;pointer-events:auto;font:600 11px var(--display);padding:4px 11px;border-radius:99px;background:#16181ccc;backdrop-filter:blur(12px);color:#fff;box-shadow:inset 0 0 0 1px #ffffff22;cursor:pointer;border:0;opacity:0;transition:opacity .2s,transform .38s cubic-bezier(.22,1,.36,1)}
+.nz.open .nz-clear{opacity:1}
+@media (prefers-reduced-motion:reduce){.nz-slot,.nz-card{transition:none!important;animation-duration:.01s!important}}
+</style></head>
+<body>
+<header class="top">
+  <h1>Lumen notifications lab <em>0.6.0</em></h1>
+  <p>Mac-style notification module. Own window, separate from the island. Replaces Windows toasts. Anchor to any corner, stack when several arrive, hover to fan out. Nothing here touches the app.</p>
+</header>
+<div class="wrap"><div class="lab">
+<aside class="ctl">
+  <div class="grp"><h3>Corner</h3>
+    <div class="corners" id="corners">
+      <button class="tl" data-c="tl" aria-label="Top left">TL</button><button class="tr" data-c="tr" aria-label="Top right">TR</button>
+      <button class="bl" data-c="bl" aria-label="Bottom left">BL</button><button class="br" data-c="br" aria-label="Bottom right">BR</button>
+    </div>
+  </div>
+  <div class="grp"><h3>Stacking</h3>
+    <div class="seg" id="mode"><button data-v="stack">Stack (Mac)</button><button data-v="tile">Tile list</button></div>
+    <div class="seg" id="order"><button data-v="new">Newest nearest corner</button><button data-v="old">Oldest</button></div>
+  </div>
+  <div class="grp"><h3>Send</h3>
+    <div class="btns" id="send"></div>
+    <button class="btn pri" id="burst">Burst 5</button>
+    <button class="btn" id="clear">Clear all</button>
+  </div>
+  <div class="grp"><h3>Layout</h3>
+    <label class="rng">Max shown<input type="range" id="max" min="1" max="8" value="4"><output></output></label>
+    <label class="rng">Timeout s<input type="range" id="to" min="0" max="15" value="6"><output></output></label>
+    <label class="rng">Width<input type="range" id="w" min="300" max="440" value="360"><output></output></label>
+    <label class="rng">Gap<input type="range" id="gap" min="4" max="24" value="10"><output></output></label>
+    <label class="rng">Margin<input type="range" id="m" min="8" max="48" value="16"><output></output></label>
+  </div>
+  <div class="grp"><h3>Glass</h3>
+    <label class="rng">Blur<input type="range" id="blur" min="0" max="40" value="22"><output></output></label>
+    <label class="rng">Tint<input type="range" id="tint" min="20" max="95" value="55"><output></output></label>
+    <label class="rng">Radius<input type="range" id="r" min="8" max="30" value="20"><output></output></label>
+  </div>
+  <div class="grp"><h3>What I understood</h3>
+    <ul class="spec">
+      <li><b>Default top-right</b>, switchable to all 4 corners.</li>
+      <li><b>Many at once</b>: new one slides in, older ones tuck behind it.</li>
+      <li><b>Hover</b> the stack to fan out; × closes one, Clear all closes the lot.</li>
+      <li>Timer pauses while hovered. Timeout 0 = sticky.</li>
+      <li>Top corners grow downward, bottom corners grow upward.</li>
+      <li>Avoids the island notch row and the taskbar.</li>
+    </ul>
+  </div>
+</aside>
+
+<div class="stage" id="stage">
+  <div class="win w1"><div class="tb"><i></i><i></i><i></i></div><div class="ln" style="width:70%"></div><div class="ln" style="width:55%"></div><div class="ln" style="width:80%"></div><div class="ln" style="width:40%"></div></div>
+  <div class="win w2"><div class="tb"><i></i><i></i><i></i></div><div class="ln" style="width:60%"></div><div class="ln" style="width:85%"></div><div class="ln" style="width:50%"></div></div>
+  <div class="notch"></div>
+  <div class="hint">fake desktop, so you can see the glass blur over windows</div>
+  <div class="taskbar"><i></i><i></i><i></i><i></i><i></i><b>14:32</b></div>
+  <div class="nz tr" id="nz"></div>
+</div>
+</div></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const ICON={
+ msg:'<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
+ mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
+ cal:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+ sys:'<circle cx="12" cy="12" r="3.2"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M5.6 18.4l1.8-1.8M16.6 7.4l1.8-1.8"/>',
+ dl:'<path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14"/>'
+};
+const KINDS={
+ msg:{app:'Messages',c:'linear-gradient(150deg,#34d058,#16a34a)',pool:[['Maya','are we still on for 7? I can bring the speaker'],['Dev group','Jordan: pushed the fix, can someone check CI'],['Mom','Call me when you are free']]},
+ mail:{app:'Mail',c:'linear-gradient(150deg,#4aa8ff,#2563eb)',pool:[['Your invoice is ready','Billing: November statement is attached, due in 14 days'],['Weekly digest','12 new replies across 4 threads you follow']]},
+ cal:{app:'Calendar',c:'linear-gradient(150deg,#ff6b6b,#dc2626)',pool:[['Design sync in 10 min','Room 3 / Meet link attached'],['Dentist','Thursday 4:00 PM, 22 Elm St']],act:['Join','Snooze']},
+ sys:{app:'Lumen',c:'linear-gradient(150deg,#8b9bff,#5b4bdb)',pool:[['Battery at 15%','Plug in soon to avoid shutdown'],['Update ready','Lumen 0.6.0 will install on next restart']],act:['Restart','Later']},
+ dl:{app:'Downloads',c:'linear-gradient(150deg,#fbbf24,#d97706)',pool:[['lumen-0.6.0-setup.exe','Downloading 38 MB of 62 MB']],prog:true}
+};
+const st={corner:'tr',mode:'stack',order:'new',max:4,to:6,w:360,gap:10,m:16,blur:22,tint:55,r:20};
+const list=[];let uid=0,hover=false,pick={};
+const nz=$('#nz');
+
+// ---- controls
+function seg(id,key,cb){const el=$(id);el.querySelectorAll('button').forEach(b=>{b.onclick=()=>{st[key]=b.dataset.v;sync();cb&&cb()}});}
+function sync(){
+  document.querySelectorAll('#mode button,#order button').forEach(b=>b.setAttribute('aria-pressed',st[b.parentElement.id]===b.dataset.v));
+  document.querySelectorAll('#corners button').forEach(b=>b.setAttribute('aria-pressed',st.corner===b.dataset.c));
+  nz.className='nz '+st.corner+(hover?' open':'');
+  nz.style.setProperty('--w',st.w+'px');nz.style.setProperty('--m',st.m+'px');nz.style.setProperty('--r',st.r+'px');
+  nz.style.setProperty('--blur',st.blur+'px');nz.style.setProperty('--tint','rgba(22,24,30,'+(st.tint/100)+')');
+  layout();
+}
+seg('#mode','mode');seg('#order','order');
+document.querySelectorAll('#corners button').forEach(b=>b.onclick=()=>{st.corner=b.dataset.c;sync()});
+['max','to','w','gap','m','blur','tint','r'].forEach(k=>{const i=$('#'+k),o=i.parentElement.querySelector('output');
+  const f=()=>{st[k]=+i.value;o.textContent=k==='to'&&st[k]===0?'∞':st[k];sync()};i.oninput=f;f();});
+
+const sendEl=$('#send');
+Object.entries(KINDS).forEach(([k,v])=>{const b=document.createElement('button');b.className='btn';b.innerHTML=`<i style="background:${v.c}"></i>${v.app}`;b.onclick=()=>add(k);sendEl.appendChild(b)});
+$('#burst').onclick=()=>{const ks=Object.keys(KINDS);for(let i=0;i<5;i++)setTimeout(()=>add(ks[i%ks.length]),i*260)};
+$('#clear').onclick=clearAll;
+
+// ---- model
+function add(kind){
+  const K=KINDS[kind];pick[kind]=((pick[kind]??-1)+1)%K.pool.length;const [t,x]=K.pool[pick[kind]];
+  const n={id:++uid,kind,K,t,x,born:Date.now(),left:st.to*1000,prog:K.prog?0.4:null,gone:false};
+  list.unshift(n);buildCard(n);layout();
+}
+function dismiss(n){if(n.gone)return;n.gone=true;n.card.classList.add('out');setTimeout(()=>{n.slot.remove();const i=list.indexOf(n);if(i>-1)list.splice(i,1);layout()},260);layout()}
+function clearAll(){[...list].forEach((n,i)=>setTimeout(()=>dismiss(n),i*50))}
+
+function buildCard(n){
+  const s=document.createElement('div');s.className='nz-slot';
+  s.innerHTML=`<div class="nz-card"><button class="nz-x" aria-label="Dismiss"><svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+   <div class="nz-ico" style="background:${n.K.c}"><svg viewBox="0 0 24 24">${ICON[n.kind]}</svg></div>
+   <div class="nz-body"><div class="nz-top"><b>${n.K.app}</b><span>now</span></div>
+   <div class="nz-title"></div><div class="nz-text"></div>
+   ${n.K.prog?'<div class="nz-prog"><i style="width:40%"></i></div>':''}
+   ${n.K.act?'<div class="nz-act">'+n.K.act.map(a=>`<button>${a}</button>`).join('')+'</div>':''}</div></div>`;
+  s.querySelector('.nz-title').textContent=n.t;s.querySelector('.nz-text').textContent=n.x;
+  s.querySelector('.nz-x').onclick=e=>{e.stopPropagation();dismiss(n)};
+  s.querySelectorAll('.nz-act button').forEach(b=>b.onclick=()=>dismiss(n));
+  s.querySelector('.nz-card').onclick=()=>dismiss(n);
+  n.slot=s;n.card=s.firstElementChild;nz.appendChild(s);
+}
+
+// ---- layout: index 0 = front card (nearest the corner). Stack = tucked behind; tile/hover = fanned list.
+function layout(){
+  const dir=st.corner[0]==='t'?1:-1;           // +1 grow down (top), -1 grow up (bottom)
+  const live=list.filter(n=>!n.gone);
+  const ordered=st.order==='new'?live:[...live].reverse();
+  const fan=st.mode==='tile'||hover;
+  const shown=ordered.slice(0,st.max),extra=ordered.length-shown.length;
+  let y=0;
+  list.forEach(n=>{n.card.style.height=''});
+  const frontH=ordered[0]?ordered[0].card.offsetHeight:0;   // tucked slabs match the front card so the peeks line up
+  list.forEach(n=>{if(n.gone){n.slot.style.opacity='0';return}
+    const i=ordered.indexOf(n);
+    if(i>=st.max){n.slot.style.opacity='0';n.slot.style.pointerEvents='none';n.slot.style.transform=`translateY(${dir*y}px) scale(.8)`;return}
+    n.slot.style.pointerEvents='';
+    const h=n.card.offsetHeight||70;
+    n.slot.classList.toggle('front',i===0);n.slot.classList.toggle('behind',!fan&&i>0);
+    n.slot.style.zIndex=100-i;
+    if(fan){n.slot.style.transform=`translateY(${dir*y}px) scale(1)`;n.slot.style.opacity='1';n.slot.style.filter='none';y+=h+st.gap}
+    else{ // tucked: each card peeks 9px, shrinks 5%
+      const k=Math.min(i,3),sc=1-k*.06;
+      n.slot.style.transform=`translateY(${dir*k*13}px) scale(${sc})`;n.slot.style.opacity=i>3?'0':String(1-k*.18);n.slot.style.filter=k?`brightness(${1-k*.06})`:'none';
+      if(i>0)n.card.style.height=frontH+'px'; if(i===0)y=h;}
+  });
+  // stack mode: container height = front card + peeks (so hover area is tight)
+  if(!fan&&shown.length){const f=shown[0];y=(f.card.offsetHeight||70)+Math.min(shown.length-1,3)*13}
+  nz.style.height=Math.max(0,y-(fan?st.gap:0))+'px';nz.style.width=st.w+'px';
+  // overflow pill + clear-all
+  nz.querySelectorAll('.nz-more,.nz-clear').forEach(e=>e.remove());
+  if(extra>0&&fan){const p=document.createElement('button');p.className='nz-more';p.textContent='+'+extra+' more';
+    p.style[st.corner[1]==='l'?'left':'right']='0';p.style[st.corner[0]==='t'?'top':'bottom']=(y)+'px';p.onclick=clearAll;p.title='Clear all';nz.appendChild(p)}
+  if(live.length>1){const c=document.createElement('button');c.className='nz-clear';c.textContent='Clear all';c.onclick=clearAll;
+    c.style[st.corner[1]==='l'?'right':'left']='0'; // opposite side of the corner, above/below the stack
+    c.style[st.corner[0]==='t'?'top':'bottom']='-26px';c.style.pointerEvents='auto';nz.appendChild(c)}
+}
+nz.addEventListener('mouseenter',()=>{hover=true;sync()});
+nz.addEventListener('mouseleave',()=>{hover=false;sync()});
+// hover target: container must catch the pointer even between cards
+nz.style.pointerEvents='auto';
+
+// ---- timers (pause while hovered; progress sim for downloads)
+setInterval(()=>{
+  list.forEach(n=>{if(n.gone)return;
+    if(n.prog!==null){n.prog=Math.min(1,n.prog+.01);const b=n.slot.querySelector('.nz-prog i');if(b)b.style.width=(n.prog*100)+'%';
+      const t=n.slot.querySelector('.nz-text');if(t)t.textContent=n.prog>=1?'Download complete':'Downloading '+Math.round(62*n.prog)+' MB of 62 MB'}
+    if(st.to===0||hover)return;
+    n.left-=100;if(n.left<=0)dismiss(n);});
+},100);
+sync();
+// demo: show a stack on load
+['msg','mail','cal'].forEach((k,i)=>setTimeout(()=>add(k),400+i*500));
+</script>
+</body></html>

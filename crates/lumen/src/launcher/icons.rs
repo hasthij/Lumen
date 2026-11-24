@@ -105,12 +105,15 @@ impl IconLoader {
     }
 }
 
-unsafe fn load(wic: &IWICImagingFactory, target: &str, px: i32) -> Option<Pixels> {
+pub unsafe fn load(wic: &IWICImagingFactory, target: &str, px: i32) -> Option<Pixels> {
     let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(target), None).ok()?;
     let factory: IShellItemImageFactory = item.cast().ok()?;
-    let hbm = factory.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+    // A picture file (a chat avatar) wants its picture; anything else wants its icon.
+    let lower = target.to_lowercase();
+    let flags = if [".png", ".jpg", ".jpeg", ".bmp"].iter().any(|e| lower.ends_with(e)) { SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK } else { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK };
+    let hbm = factory.GetImage(SIZE { cx: px, cy: px }, flags).ok()?;
     let result = (|| -> windows::core::Result<Pixels> {
-        let bmp = wic.CreateBitmapFromHBITMAP(hbm, HPALETTE::default(), WICBitmapUsePremultipliedAlpha)?;
+        let bmp = wic.CreateBitmapFromHBITMAP(hbm, HPALETTE::default(), WICBitmapUseAlpha)?; // the shell's alpha is straight; the converter premultiplies
         let scaled = wic.CreateBitmapScaler()?;
         scaled.Initialize(&bmp, px as u32, px as u32, WICBitmapInterpolationModeHighQualityCubic)?;
         let conv = wic.CreateFormatConverter()?;

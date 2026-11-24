@@ -266,6 +266,16 @@ pub struct LayeredSurface {
     old: HGDIOBJ,
     width: u32,
     height: u32,
+    /// Blurred picture of what is behind the window, spread over the whole scene.
+    backdrop: Option<Backdrop>,
+    backdrop_bmp: Option<ID2D1Bitmap>,
+}
+
+/// Opaque BGRA pixels that `Item::Glass` shows, stretched over the scene's size.
+pub struct Backdrop {
+    pub w: u32,
+    pub h: u32,
+    pub px: Vec<u8>,
 }
 
 impl LayeredSurface {
@@ -275,7 +285,7 @@ impl LayeredSurface {
         if dc.is_invalid() {
             return Err(windows::core::Error::from_win32());
         }
-        Ok(Self { d2d, target: None, dc, bitmap: HBITMAP::default(), images: HashMap::new(), wic: None, bits: std::ptr::null_mut(), old: HGDIOBJ::default(), width: 0, height: 0 })
+        Ok(Self { d2d, target: None, dc, bitmap: HBITMAP::default(), images: HashMap::new(), wic: None, bits: std::ptr::null_mut(), old: HGDIOBJ::default(), width: 0, height: 0, backdrop: None, backdrop_bmp: None })
     }
 
     fn ensure_size(&mut self, width: u32, height: u32) -> Result<()> {
@@ -311,6 +321,11 @@ impl LayeredSurface {
         Ok(())
     }
 
+    pub fn set_backdrop(&mut self, b: Option<Backdrop>) {
+        self.backdrop = b;
+        self.backdrop_bmp = None;
+    }
+
     fn target(&mut self) -> Result<ID2D1DCRenderTarget> {
         if let Some(t) = &self.target {
             return Ok(t.clone());
@@ -338,6 +353,7 @@ impl LayeredSurface {
             crate::warn!("draw failed ({e}), recreating render target");
             self.target = None;
             self.images.clear();
+            self.backdrop_bmp = None;
             self.draw(fonts, scene, scale)?;
         }
         let size = SIZE { cx: self.width as i32, cy: self.height as i32 };
@@ -376,14 +392,22 @@ impl LayeredSurface {
         }
         let bitmap = (|| -> Option<ID2D1Bitmap> {
             let wic = self.wic.as_ref()?;
-            let decoder = wic.CreateDecoderFromFilename(&HSTRING::from(path), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
-            let frame = decoder.GetFrame(0).ok()?;
-            let conv = wic.CreateFormatConverter().ok()?;
-            conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
-            let (mut w, mut h) = (0u32, 0u32);
-            conv.GetSize(&mut w, &mut h).ok()?;
-            let mut data = vec![0u8; (w * h * 4) as usize];
-            conv.CopyPixels(std::ptr::null(), w * 4, &mut data).ok()?;
+            let (w, h, mut data);
+            if let Some(app) = path.strip_prefix("icon:") {
+                // "icon:<exe path or shell:AppsFolder\AppId>": the app's own shell icon.
+                let p = crate::launcher::icons::load(wic, app, 96)?;
+                (w, h, data) = (p.w, p.h, p.data);
+            } else {
+                let decoder = wic.CreateDecoderFromFilename(&HSTRING::from(path), None, windows::Win32::Foundation::GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
+                let frame = decoder.GetFrame(0).ok()?;
+                let conv = wic.CreateFormatConverter().ok()?;
+                conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+                let (mut cw, mut ch) = (0u32, 0u32);
+                conv.GetSize(&mut cw, &mut ch).ok()?;
+                let mut buf = vec![0u8; (cw * ch * 4) as usize];
+                conv.CopyPixels(std::ptr::null(), cw * 4, &mut buf).ok()?;
+                (w, h, data) = (cw, ch, buf);
+            }
             if tint[0] < 1.0 || tint[1] < 1.0 || tint[2] < 1.0 {
                 for px in data.chunks_exact_mut(4) {
                     px[0] = (px[0] as f32 * tint[2]) as u8;
@@ -440,6 +464,29 @@ impl LayeredSurface {
                             let dh = if *h > 0.0 { *h } else if *w > 0.0 && size.width > 0.0 { *w * size.height / size.width } else { size.height };
                             let dest = D2D_RECT_F { left: *x, top: *y, right: x + dw, bottom: y + dh };
                             target.DrawBitmap(&bmp, Some(&dest), *alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        }
+                    }
+                    Item::Glass { x, y, w, h, radius, alpha } => {
+                        if self.backdrop_bmp.is_none() {
+                            if let Some(b) = &self.backdrop {
+                                let props = D2D1_BITMAP_PROPERTIES {
+                                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                                    dpiX: 96.0,
+                                    dpiY: 96.0,
+                                };
+                                self.backdrop_bmp = target.CreateBitmap(D2D_SIZE_U { width: b.w, height: b.h }, Some(b.px.as_ptr() as *const _), b.w * 4, &props).ok();
+                            }
+                        }
+                        if let (Some(bmp), Some(b)) = (&self.backdrop_bmp, &self.backdrop) {
+                            let bp = D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
+                            let brp = D2D1_BRUSH_PROPERTIES {
+                                opacity: *alpha,
+                                transform: windows::Foundation::Numerics::Matrix3x2 { M11: scene.width as f32 / b.w as f32, M12: 0.0, M21: 0.0, M22: scene.height as f32 / b.h as f32, M31: 0.0, M32: 0.0 },
+                            };
+                            if let Ok(br) = target.CreateBitmapBrush(bmp, Some(&bp), Some(&brp)) {
+                                let rr = D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: *x, top: *y, right: x + w, bottom: y + h }, radiusX: *radius, radiusY: *radius };
+                                target.FillRoundedRectangle(&rr, &br);
+                            }
                         }
                     }
                     Item::Rect { x, y, w, h, radius, fill, stroke, stroke_width } => {

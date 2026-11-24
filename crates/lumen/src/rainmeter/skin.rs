@@ -42,6 +42,8 @@ pub enum Item {
     /// A picture file. `h` of 0 keeps the picture's own proportions; `tint` multiplies its colours.
     Image { path: String, x: f32, y: f32, w: f32, h: f32, alpha: f32, tint: Rgba },
     Rect { x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Rgba, stroke: Rgba, stroke_width: f32 },
+    /// The surface's blurred backdrop picture (see `LayeredSurface::set_backdrop`) clipped to a rounded rectangle.
+    Glass { x: f32, y: f32, w: f32, h: f32, radius: f32, alpha: f32 },
 }
 
 #[derive(Debug, Clone, Default)]
