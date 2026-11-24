@@ -151,6 +151,7 @@ enum Hit {
     MnFullscreen,
     MnFocus,
     MnIconBg,
+    MnLetter,
     MnLive,
     MnBlockWin,
     MnTest,
@@ -617,6 +618,10 @@ impl Settings {
             }
             Hit::MnIconBg => {
                 self.cfg.macnotif.icon_bg = !self.cfg.macnotif.icon_bg;
+                self.commit_config();
+            }
+            Hit::MnLetter => {
+                self.cfg.macnotif.letter_icon = !self.cfg.macnotif.letter_icon;
                 self.commit_config();
             }
             Hit::MnFocus => {
@@ -1794,6 +1799,9 @@ impl Settings {
         }
         self.card(y, 68.0, Some(('\u{E7C9}', None)), "Icon background", "Tinted square behind the icon; off shows the bare icon or avatar");
         self.toggle(right, y + 34.0, mn.icon_bg, Hit::MnIconBg, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E8D2}', None)), "Letter icon", "When an app has no icon or picture, show its first letter; off shows no icon");
+        self.toggle(right, y + 34.0, mn.letter_icon, Hit::MnLetter, true);
         y += 72.0;
         y += 20.0;
 

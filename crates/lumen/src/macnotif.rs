@@ -190,7 +190,8 @@ impl MacNotif {
     /// Adds a notification at the front of the stack.
     pub fn post(&mut self, n: Notice) {
         let exe = resolve_app(&n.exe);
-        let icon = if !n.image.is_empty() {
+        // A picture that vanished or is empty would leave a blank tile: fall back to the app icon / letter.
+        let icon = if !n.image.is_empty() && std::fs::metadata(&n.image).map_or(false, |m| m.len() > 0) {
             format!("icon:{}", n.image)
         } else if exe.is_empty() {
             String::new()
@@ -619,11 +620,14 @@ impl MacNotif {
             // Icon tile: the app's own icon if there is one, else its initial on a colour.
             let (tx, ty) = (x + 14.0, y + 14.0);
             let isz = self.cfg.icon_size as f32;
-            let bg = c.icon.is_empty() || self.cfg.icon_bg;
+            let iconless = c.icon.is_empty() && !self.cfg.letter_icon;
+            let bg = !iconless && (c.icon.is_empty() || self.cfg.icon_bg);
             if bg {
                 items.push(Item::Rect { x: tx, y: ty, w: isz, h: isz, radius: isz * 0.25, fill: [c.tile[0], c.tile[1], c.tile[2], if c.icon.is_empty() { alpha } else { 0.18 * alpha }], stroke: [0.0; 4], stroke_width: 0.0 });
             }
-            if c.icon.is_empty() {
+            if iconless {
+                // No icon at all: the text column starts at the card's left padding instead.
+            } else if c.icon.is_empty() {
                 let st = style(isz * 0.47, 700);
                 let initial: String = c.app.chars().next().unwrap_or('N').to_uppercase().collect();
                 let (iw, ih) = self.fonts.measure(&initial, &st);
@@ -632,7 +636,7 @@ impl MacNotif {
                 let inset = if bg { isz / 12.0 } else { 0.0 };
                 items.push(Item::Image { path: c.icon.clone(), x: tx + inset, y: ty + inset, w: isz - inset * 2.0, h: isz - inset * 2.0, alpha, tint: [1.0; 4] });
             }
-            let tx = x + 24.0 + isz;
+            let tx = if iconless { x + 18.0 } else { x + 24.0 + isz };
             items.push(Item::Text { text: c.app.to_uppercase(), style: style(10.5, 600), color: white(0.72), x: tx, y: y + 11.0, stretch: 1.0 });
             if hover_idx == Some(i) {
                 items.push(Item::Rect { x: x + w - 28.0, y: y + 8.0, w: 18.0, h: 18.0, radius: 9.0, fill: white(0.16), stroke: [0.0; 4], stroke_width: 0.0 });

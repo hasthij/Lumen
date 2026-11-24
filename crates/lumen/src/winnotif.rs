@@ -159,7 +159,7 @@ fn read(n: &windows::UI::Notifications::UserNotification) -> Option<Notice> {
     }
     let title = texts.remove(0);
     let exe = if aumid.is_empty() { String::new() } else { format!("shell:AppsFolder\\{aumid}") };
-    let (image, silent) = avatar(&first);
+    let (image, silent) = avatar(&first, &aumid);
     // A toast marked silent leaves the sound to the app. Apps that do play their own (chat apps) are
     // left alone; any other silent one gets the Windows notification sound so it is not mute.
     if silent && !SELF_SOUND.iter().any(|a| aumid.to_lowercase().contains(a) || label.to_lowercase().contains(a)) {
@@ -173,13 +173,17 @@ fn read(n: &windows::UI::Notifications::UserNotification) -> Option<Notice> {
 
 /// The picture a toast carries (a Discord avatar, a Telegram chat photo). The listener API does not
 /// expose it, so it is read out of Windows' notification store: the newest record with this title.
-fn avatar(title: &str) -> (String, bool) {
+fn avatar(title: &str, aumid: &str) -> (String, bool) {
     let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("Microsoft").join("Windows").join("Notifications");
     let needle = title.as_bytes();
     if needle.is_empty() {
         return (String::new(), false);
     }
     for name in ["wpndatabase.db-wal", "wpndatabase.db"] {
+        // A runaway store must not stall the listener thread.
+        if std::fs::metadata(dir.join(name)).map_or(true, |m| m.len() > 256 << 20) {
+            continue;
+        }
         let Ok(buf) = std::fs::read(dir.join(name)) else { continue };
         let Some(at) = buf.windows(needle.len()).rposition(|w| w == needle) else { continue };
         // Stay inside this toast's own XML, or a neighbour's picture (Discord's) gets picked up.
@@ -197,10 +201,7 @@ fn avatar(title: &str) -> (String, bool) {
             if let Some(i) = tag.find("src=\"") {
                 let rest = &tag[i + 5..];
                 if let Some(end) = rest.find('"') {
-                    let mut src = rest[..end].replace("&amp;", "&");
-                    if let Some(r) = src.strip_prefix("file:///").or_else(|| src.strip_prefix("file://")) {
-                        src = r.replace("%20", " ");
-                    }
+                    let src = resolve_src(&rest[..end].replace("&amp;", "&"), aumid);
                     if let Some(path) = stash(&src) {
                         return (path, silent);
                     }
@@ -210,6 +211,49 @@ fn avatar(title: &str) -> (String, bool) {
         return (String::new(), silent);
     }
     (String::new(), false)
+}
+
+/// Turns a toast picture reference into something `stash` can read: percent-decodes file URIs and
+/// maps a packaged app's `ms-appdata:///local|roaming|temp/...` into its Packages folder.
+/// http(s) and plain paths pass through.
+fn resolve_src(src: &str, aumid: &str) -> String {
+    let decode = |s: &str| {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let hex = (b[i] == b'%' && i + 2 < b.len()).then(|| std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())).flatten();
+            match hex {
+                Some(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                None => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    if let Some(r) = src.strip_prefix("file:///").or_else(|| src.strip_prefix("file://")) {
+        return decode(r);
+    }
+    let lower = src.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("ms-appdata:///").map(|_| &src["ms-appdata:///".len()..]) {
+        let (kind, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let pfn = aumid.split('!').next().unwrap_or("");
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let sub = match kind.to_ascii_lowercase().as_str() {
+            "local" => "LocalState",
+            "roaming" => "RoamingState",
+            _ => "AC\\Temp",
+        };
+        if !pfn.is_empty() && !local.is_empty() {
+            return format!("{local}\\Packages\\{pfn}\\{sub}\\{}", decode(tail).replace('/', "\\"));
+        }
+    }
+    src.to_string()
 }
 
 /// Keeps a copy of a toast picture under %TEMP%\LumenAvatars: apps delete their own temp files
@@ -245,7 +289,11 @@ fn stash(src: &str) -> Option<String> {
 }
 
 /// Apps that play their own message sound when a toast is silent.
-const SELF_SOUND: [&str; 8] = ["discord", "telegram", "whatsapp", "slack", "teams", "signal", "spotify", "skype"];
+/// Matched as a substring, so "discord" also covers Canary, PTB, Vesktop, Legcord and the like.
+const SELF_SOUND: [&str; 21] = [
+    "discord", "vesktop", "legcord", "armcord", "telegram", "whatsapp", "slack", "teams", "signal", "spotify", "skype", "element", "viber", "zoom", "messenger", "beeper",
+    "guilded", "revolt", "stoat", "wechat", "threema",
+];
 
 // ---- Muting Windows' own banners ----------------------------------------------------------
 
@@ -445,4 +493,17 @@ pub fn test_toast(kind: u8) {
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
         .creation_flags(0x0800_0000)
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_src;
+
+    #[test]
+    fn resolves_picture_refs() {
+        assert_eq!(resolve_src("file:///C:/a%20b/c%28d%29.png", ""), "C:/a b/c(d).png");
+        assert_eq!(resolve_src("https://cdn.discordapp.com/a.png?x=1", "x"), "https://cdn.discordapp.com/a.png?x=1");
+        std::env::set_var("LOCALAPPDATA", r"C:\L");
+        assert_eq!(resolve_src("ms-appdata:///local/img/a%20b.png", "Pkg_123!App"), r"C:\L\Packages\Pkg_123\LocalState\img\a b.png");
+    }
 }

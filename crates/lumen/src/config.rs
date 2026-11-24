@@ -61,6 +61,8 @@ pub struct MacNotifConfig {
     pub icon_size: u32,
     /// Draw the tinted square behind the icon.
     pub icon_bg: bool,
+    /// A card with no picture or app icon shows a letter tile; off drops the icon and the text shifts left.
+    pub letter_icon: bool,
     /// Keep refreshing the blurred backdrop so it follows what is behind the cards.
     pub live_blur: bool,
     /// Keep showing while a fullscreen app or game is in front.
@@ -89,6 +91,7 @@ impl Default for MacNotifConfig {
             radius: 20,
             icon_size: 36,
             icon_bg: true,
+            letter_icon: true,
             live_blur: false,
             over_fullscreen: false,
             respect_focus: true,
