@@ -51,7 +51,7 @@ unsafe fn on_update_result(hwnd: HWND, manual: bool) {
     let found = crate::update::FOUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(r) = found else {
         if manual {
-            MessageBoxW(hwnd, &HSTRING::from(format!("Lumen {} is the latest version.", env!("CARGO_PKG_VERSION"))), w!("Lumen"), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(hwnd, &HSTRING::from(format!("Lumen {} is the latest version.", env!("CARGO_PKG_VERSION"))), w!("Lumen"), MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
         }
         return;
     };
@@ -60,17 +60,25 @@ unsafe fn on_update_result(hwnd: HWND, manual: bool) {
     } else {
         (format!("Lumen {} is available (you have {}).\n\nDownload and install it now?", r.version, env!("CARGO_PKG_VERSION")), w!("Lumen update"), MB_ICONINFORMATION)
     };
-    if MessageBoxW(hwnd, &HSTRING::from(msg), title, MB_YESNO | icon) != IDYES {
+    if MessageBoxW(hwnd, &HSTRING::from(msg), title, MB_YESNO | icon | MB_TOPMOST | MB_SETFOREGROUND) != IDYES {
         return;
     }
-    match crate::update::download(&r) {
-        Some(setup) => {
-            let _ = std::process::Command::new(setup).arg("/S").spawn();
-            PostQuitMessage(0);
-        }
-        None => {
-            MessageBoxW(hwnd, w!("Download failed. Check your connection and try again."), w!("Lumen"), MB_OK | MB_ICONWARNING);
-        }
+    // Download off the UI thread so the app (settings, clock, island) stays responsive.
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let ok = match crate::update::download(&r) {
+            Some(setup) => std::process::Command::new(setup).arg("/S").spawn().is_ok(),
+            None => false,
+        };
+        let _ = PostMessageW(HWND(h as *mut _), crate::update::WM_UPDATE_DONE, WPARAM(ok as usize), LPARAM(0));
+    });
+}
+
+unsafe fn on_update_done(hwnd: HWND, ok: bool) {
+    if ok {
+        PostQuitMessage(0);
+    } else {
+        MessageBoxW(hwnd, w!("Download failed. Check your connection and try again."), w!("Lumen"), MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
     }
 }
 
@@ -718,6 +726,10 @@ impl App {
             }
             crate::update::WM_UPDATE => {
                 unsafe { on_update_result(self.hwnd, wp.0 != 0) };
+                Some(LRESULT(0))
+            }
+            crate::update::WM_UPDATE_DONE => {
+                unsafe { on_update_done(self.hwnd, wp.0 != 0) };
                 Some(LRESULT(0))
             }
             WM_OPEN_LAUNCHER => {

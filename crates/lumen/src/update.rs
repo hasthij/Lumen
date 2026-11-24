@@ -9,6 +9,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 pub const WM_UPDATE: u32 = WM_APP + 40;
+/// Posted when the installer download finishes; wParam 1 = installer launched.
+pub const WM_UPDATE_DONE: u32 = WM_APP + 41;
 const API: &str = "https://api.github.com/repos/hasthij/Lumen/releases/latest";
 const NO_WINDOW: u32 = 0x0800_0000;
 
@@ -37,7 +39,7 @@ pub fn check(hwnd: HWND, manual: bool) {
 /// Download the installer to %TEMP% and return its path.
 pub fn download(r: &Release) -> Option<std::path::PathBuf> {
     let path = std::env::temp_dir().join("LumenSetup.exe");
-    let ok = Command::new("curl.exe").args(["-L", "-f", "-s", "-o"]).arg(&path).arg(&r.url).creation_flags(NO_WINDOW).status().ok()?.success();
+    let ok = Command::new("curl.exe").args(["-L", "-f", "-s", "--connect-timeout", "15", "-m", "300", "-o"]).arg(&path).arg(&r.url).creation_flags(NO_WINDOW).status().ok()?.success();
     ok.then_some(path)
 }
 
