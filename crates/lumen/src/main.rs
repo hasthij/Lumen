@@ -16,6 +16,7 @@ mod launcher;
 mod macnotif;
 #[macro_use]
 mod log;
+mod pacer;
 mod rainmeter;
 mod settings;
 mod taskbar;

@@ -25,6 +25,31 @@ pub const WM_NOTE: u32 = WM_APP + 0x32;
 static QUEUE: Mutex<Vec<Notice>> = Mutex::new(Vec::new());
 static BLOCK: AtomicBool = AtomicBool::new(false);
 
+/// How long after a toast the banner hider keeps its fast poll.
+const HIDER_BURST: Duration = Duration::from_secs(4);
+
+/// Hider poll interval: tight just after a toast arrives, relaxed otherwise.
+/// Without toast events nothing announces a toast before its banner shows, so stay fast.
+fn hider_sleep(since_activity: Duration, events: bool) -> Duration {
+    Duration::from_millis(if !events || since_activity < HIDER_BURST { 6 } else { 40 })
+}
+
+/// True once the listener's toast-event registration succeeded.
+static EVENTS: AtomicBool = AtomicBool::new(false);
+
+static ACTIVITY: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Marks "a toast just arrived" for the hider thread.
+fn note_activity() {
+    *ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
+fn last_activity() -> std::time::Instant {
+    // Before any toast the hider is relaxed: report an instant far enough back.
+    let now = std::time::Instant::now();
+    ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| now.checked_sub(HIDER_BURST * 2).unwrap_or(now))
+}
+
 const SETTINGS: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
 
 pub fn drain() -> Vec<Notice> {
@@ -43,7 +68,7 @@ pub fn start(hwnd: HWND, block: bool) {
         let mut cached = HWND::default();
         let mut tick = 0u32;
         loop {
-            std::thread::sleep(Duration::from_millis(6));
+            std::thread::sleep(hider_sleep(last_activity().elapsed(), EVENTS.load(Ordering::Relaxed)));
             if !IsWindow(HWND(h as *mut _)).as_bool() {
                 break;
             }
@@ -76,17 +101,21 @@ pub fn start(hwnd: HWND, block: bool) {
         }
         // Wake the moment Windows posts a toast (polling alone lets the banner flash first).
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let _ = listener.NotificationChanged(&windows::Foundation::TypedEventHandler::new(move |_, _| {
-            let _ = tx.send(());
-            Ok(())
-        }));
+        let events = listener
+            .NotificationChanged(&windows::Foundation::TypedEventHandler::new(move |_, _| {
+                note_activity();
+                let _ = tx.send(());
+                Ok(())
+            }))
+            .is_ok();
+        EVENTS.store(events, Ordering::Relaxed);
         let mut seen: HashSet<u32> = HashSet::new();
         let mut first = true;
         // Removal is delayed so Windows' own notification sound plays out instead of being clipped.
         let mut pending: Vec<(std::time::Instant, u32)> = Vec::new();
         loop {
             // Event-driven; the timeout is only a safety net (fast while removals are pending).
-            let wait = if !pending.is_empty() { 100 } else if BLOCK.load(Ordering::Relaxed) { 120 } else { 500 };
+            let wait = if !pending.is_empty() { 100 } else if !events { if BLOCK.load(Ordering::Relaxed) { 120 } else { 500 } } else { 2000 };
             // A dead channel returns instantly; never let that turn this into a busy loop.
             // Event registration fails for unpackaged apps, so the channel is dead: poll instead.
             if rx.recv_timeout(Duration::from_millis(wait)) == Err(std::sync::mpsc::RecvTimeoutError::Disconnected) {
@@ -113,6 +142,7 @@ pub fn start(hwnd: HWND, block: bool) {
                     QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(note);
                     fresh = true;
                 }
+                note_activity();
                 // The banner is hidden by the hider thread; the toast itself is cleared a bit later.
                 if BLOCK.load(Ordering::Relaxed) {
                     pending.push((std::time::Instant::now() + Duration::from_millis(1800), id));
@@ -184,7 +214,7 @@ fn avatar(title: &str, aumid: &str) -> (String, bool) {
         if std::fs::metadata(dir.join(name)).map_or(true, |m| m.len() > 256 << 20) {
             continue;
         }
-        let Ok(buf) = std::fs::read(dir.join(name)) else { continue };
+        let Some(buf) = read_tail(&dir.join(name), STORE_TAIL) else { continue };
         let Some(at) = buf.windows(needle.len()).rposition(|w| w == needle) else { continue };
         // Stay inside this toast's own XML, or a neighbour's picture (Discord's) gets picked up.
         let from = buf[..at].windows(6).rposition(|w| w == b"<toast").unwrap_or(at.saturating_sub(1500));
@@ -211,6 +241,39 @@ fn avatar(title: &str, aumid: &str) -> (String, bool) {
         return (String::new(), silent);
     }
     (String::new(), false)
+}
+
+/// The newest toast records sit at the end of the store, so only that much is read per toast.
+const STORE_TAIL: u64 = 16 << 20;
+/// Most pictures kept in the avatar folder.
+const MAX_AVATARS: usize = 200;
+
+/// The last `max` bytes of a file (all of it when smaller).
+fn read_tail(path: &std::path::Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
+    let mut buf = Vec::with_capacity(len.min(max) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Deletes the oldest files in `dir` until at most `keep` remain.
+fn prune_dir(dir: &std::path::Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(t, _)| *t);
+    let excess = files.len() - keep;
+    for (_, p) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// Turns a toast picture reference into something `stash` can read: percent-decodes file URIs and
@@ -267,6 +330,10 @@ fn stash(src: &str) -> Option<String> {
     let ext = if src.to_lowercase().contains(".webp") { "webp" } else if src.to_lowercase().contains(".jpg") || src.to_lowercase().contains(".jpeg") { "jpg" } else { "png" };
     let dest = dir.join(format!("{:016x}.{ext}", h.finish()));
     if !dest.exists() {
+        static NEW_FILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if NEW_FILES.fetch_add(1, Ordering::Relaxed) % 25 == 0 {
+            prune_dir(&dir, MAX_AVATARS);
+        }
         if src.starts_with("http://") || src.starts_with("https://") {
             use std::os::windows::process::CommandExt;
             let ok = std::process::Command::new("curl.exe")
@@ -497,7 +564,7 @@ pub fn test_toast(kind: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_src;
+    use super::*;
 
     #[test]
     fn resolves_picture_refs() {
@@ -505,5 +572,40 @@ mod tests {
         assert_eq!(resolve_src("https://cdn.discordapp.com/a.png?x=1", "x"), "https://cdn.discordapp.com/a.png?x=1");
         std::env::set_var("LOCALAPPDATA", r"C:\L");
         assert_eq!(resolve_src("ms-appdata:///local/img/a%20b.png", "Pkg_123!App"), r"C:\L\Packages\Pkg_123\LocalState\img\a b.png");
+    }
+
+    #[test]
+    fn hider_is_fast_only_just_after_a_toast() {
+        assert_eq!(hider_sleep(Duration::ZERO, true), Duration::from_millis(6));
+        assert_eq!(hider_sleep(HIDER_BURST, true), Duration::from_millis(40));
+        assert_eq!(hider_sleep(HIDER_BURST, false), Duration::from_millis(6));
+    }
+
+    #[test]
+    fn read_tail_returns_only_the_end() {
+        let p = std::env::temp_dir().join("lumen_tail_test.bin");
+        std::fs::write(&p, b"0123456789").unwrap();
+        assert_eq!(read_tail(&p, 4).unwrap(), b"6789");
+        assert_eq!(read_tail(&p, 100).unwrap(), b"0123456789");
+        let _ = std::fs::remove_file(&p);
+        assert!(read_tail(&p, 4).is_none());
+    }
+
+    #[test]
+    fn prune_dir_keeps_newest() {
+        let d = std::env::temp_dir().join("lumen_prune_test");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..5 {
+            std::fs::write(d.join(format!("{i}.png")), b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        prune_dir(&d, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["3.png", "4.png"]);
+        prune_dir(&d, 10);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -6,3 +6,5 @@
 *.ps1
 *.md
 !/README.md
+# Claude context (local only)
+/CLAUDECONTEXT/

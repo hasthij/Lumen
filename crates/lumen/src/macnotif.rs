@@ -39,8 +39,7 @@ const PEEK: f32 = 13.0;
 const TIMER: usize = 1;
 /// Posted once per display refresh by the pacer thread while cards are moving.
 const WM_FRAME: u32 = WM_APP + 0x31;
-static FAST: AtomicBool = AtomicBool::new(false);
-static FRAME_PENDING: AtomicBool = AtomicBool::new(false);
+static PACER: crate::pacer::Pacer = crate::pacer::Pacer::new();
 
 /// What a program asks Lumen to show.
 #[derive(Clone, Default)]
@@ -293,14 +292,14 @@ impl MacNotif {
                 Some(LRESULT(0))
             }
             WM_FRAME => {
-                if FAST.load(Ordering::Relaxed) {
+                if PACER.is_fast() {
                     self.tick();
                 }
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == TIMER => {
                 // While animating, the vsync pacer drives frames; the timer is only a fallback.
-                if !FAST.load(Ordering::Relaxed) || self.last.elapsed().as_millis() > 40 {
+                if !PACER.is_fast() || self.last.elapsed().as_millis() > 40 {
                     self.tick();
                 }
                 Some(LRESULT(0))
@@ -435,7 +434,7 @@ impl MacNotif {
     }
 
     fn set_timer(&mut self, ms: u32) {
-        FAST.store(ms == 16, Ordering::Relaxed);
+        PACER.set_fast(ms == 16);
         if ms == self.timer_ms {
             return;
         }
@@ -496,7 +495,7 @@ impl MacNotif {
             self.dirty = false;
             let t0 = Instant::now();
             self.render();
-            if t0.elapsed().as_millis() > 8 {
+            if t0.elapsed().as_millis() > 40 {
                 crate::warn!("macnotif frame took {} ms", t0.elapsed().as_millis());
             }
             // A slow first draw (loading an app icon) must not eat the slide-in.
@@ -1021,19 +1020,15 @@ unsafe fn create_window() -> Result<HWND> {
     let hwnd = CreateWindowExW(ex, w!("LumenMacNotif"), w!("Lumen Notifications"), WS_POPUP, 0, 0, 1, 1, None, None, instance, None)?;
     // Vsync pacer: SetTimer is coarse (15-31 ms), so wake the UI thread once per refresh while animating.
     let h = hwnd.0 as isize;
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
         let hw = HWND(h as *mut _);
-        if !IsWindow(hw).as_bool() {
-            break;
-        }
-        if FAST.load(Ordering::Relaxed) {
-            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-            if !FRAME_PENDING.swap(true, Ordering::AcqRel) && PostMessageW(hw, WM_FRAME, WPARAM(0), LPARAM(0)).is_err() {
-                FRAME_PENDING.store(false, Ordering::Release);
-            }
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
+        PACER.run(
+            || unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            },
+            || unsafe { IsWindow(hw).as_bool() },
+            || unsafe { PostMessageW(hw, WM_FRAME, WPARAM(0), LPARAM(0)).is_ok() },
+        )
     });
     Ok(hwnd)
 }
@@ -1042,7 +1037,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_FRAME => {
-            FRAME_PENDING.store(false, Ordering::Release);
+            PACER.frame_done();
             crate::app::macnotif_message(msg, wp, lp).unwrap_or(LRESULT(0))
         }
         crate::winnotif::WM_NOTE | WM_TIMER | WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_RBUTTONDOWN => crate::app::macnotif_message(msg, wp, lp).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),

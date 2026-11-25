@@ -1,11 +1,10 @@
-# Lumen MacNotif (0.6.0, uncommitted, Cargo stays 0.5.4)
-- Built + 12 tests pass. Lumen cards verified by screenshot (contrast raised, tint floor 72%).
-- Sound: Lumen chime + its toggles REMOVED. Native Windows sound plays; toasts are removed from the center 1.8s after capture (so sound is not clipped); banner hidden by CoreWindow hider.
-- Native banner hidden by a CoreWindow hider thread; toast removed 1.8 s later so Windows' own sound plays. NotificationChanged fails for unpackaged apps (0x80070490), so the listener polls every 120 ms (500 ms if blocking is off); the first pass clears the Action Center backlog because 75 stale toasts made each poll cost 230 ms (idle CPU 50% -> 2%).
-- Cards use a real backdrop blur (screen grab + box blur) with Blur, Colour boost, Tint sliders; blur 0 = flat tint. Test toasts for Discord/Telegram are silent like the real apps. Unverified: audio by ear, real Discord, multi-monitor/high-DPI capture.
-- Unverified by ear: native sound no longer clipped, Discord/Telegram own sound with real apps.
-
-## MacNotif update (0.6.0, uncommitted)
-- Native Win11 banner = CoreWindow "New notification" (ShellExperienceHost). winnotif.rs hider thread SW_HIDEs it every 6 ms while blocking. Verified: not visible, Lumen cards show.
-- Settings > MacNotif: "Test as Discord / Telegram / other app" send real toasts via hidden PowerShell (Data_Xml_Dom feature crashes rustc, removed).
-- Sound fix: ToastEnabled untouched; scheme sounds are restored (never muted) at start.
+# Perf audit (long-run slowdown), uncommitted
+- New pacer.rs: island + macnotif vsync threads now park on a condvar when idle (were waking 66x/s each), 8 ms floor if DwmFlush returns instantly.
+- winnotif: banner-hider thread 6 ms poll only 4 s after a toast, else 40 ms; listener waits 2 s when WinRT events work; avatar() reads last 16 MB of store, not whole db; LumenAvatars pruned to 200.
+- island/media.rs: Manager rebuilt at most every 3 s (was every 500 ms when idle); Spotify window scan every 5 s when not running.
+- macnotif frame-time warn threshold 8 -> 40 ms (log spam).
+- Tests added: pacer (3), winnotif (3), media (2). 21 pass, release builds.
+- Also audited, no change needed: clock, taskbar (60 ms debounce only), app timers, launcher (icon cache capped 300, timers paired), settings, clip (capped 200/20), mixer (polls 1/s only on Sound tab), lumen-tap.
+- Known minor, skipped: settings window leaks one HICON (icon::create) per open.
+- 21 tests pass, release builds. Not run for hours on screen, so real-world effect unverified.
+- Version bumped to 0.6.4 (uncommitted, not released).

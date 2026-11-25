@@ -135,6 +135,8 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
     let mut last_playing;
     let mut last_primary = String::new();
     let mut sp_pid = 0u32;
+    let mut sp_next = Instant::now();
+    let mut mgr_made = Instant::now();
     // Cover for the Spotify stand-in, looked up on a helper thread once per track.
     let fb_art: Arc<Mutex<Option<(String, Arc<Vec<u8>>, f64)>>> = Arc::new(Mutex::new(None));
     // Spotify exposes no timeline: count playing time ourselves (seeks are not seen).
@@ -165,8 +167,12 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
         }
         let mut sessions = mgr.as_ref().map(list).unwrap_or_default();
         if sessions.is_empty() {
-            // A manager made before any app registered can stay empty; make a fresh one, then ask for the current session.
-            mgr = Manager::RequestAsync().and_then(|o| o.get()).ok();
+            // A manager made before any app registered can stay empty; make a fresh one (not on every poll:
+            // each one is a WinRT activation), then ask for the current session.
+            if rebuild_due(mgr_made.elapsed()) || mgr.is_none() {
+                mgr = Manager::RequestAsync().and_then(|o| o.get()).ok();
+                mgr_made = Instant::now();
+            }
             if let Some(m) = &mgr {
                 sessions = list(m);
                 if sessions.is_empty() {
@@ -215,7 +221,16 @@ fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc
         }
         // Spotify often registers no Windows media session; read its window unless it has one.
         if !sessions.iter().any(|(i, _)| i.to_ascii_lowercase().contains("spotify")) {
-            if let Some(t) = spotify_title(&mut sp_pid) {
+            let scan = if scan_due(sp_pid, Instant::now(), sp_next) {
+                let r = spotify_title(&mut sp_pid);
+                if sp_pid == 0 {
+                    sp_next = Instant::now() + SPOTIFY_RESCAN;
+                }
+                r
+            } else {
+                None
+            };
+            if let Some(t) = scan {
                 if let Some(tr) = t {
                     last_track = Some(tr);
                     last_playing = true;
@@ -332,6 +347,20 @@ pub fn app_name(id: &str) -> String {
     } else {
         last.into()
     }
+}
+
+/// Minimum gap between rebuilding the session manager while no app has a media session.
+const MANAGER_REBUILD: Duration = Duration::from_secs(3);
+/// Gap between full-window scans while Spotify is not running.
+const SPOTIFY_RESCAN: Duration = Duration::from_secs(5);
+
+fn rebuild_due(since_last: Duration) -> bool {
+    since_last >= MANAGER_REBUILD
+}
+
+/// A known Spotify process is cheap to check every poll; hunting for it walks every window.
+fn scan_due(pid: u32, now: Instant, next: Instant) -> bool {
+    pid != 0 || now >= next
 }
 
 /// Id of the stand-in session used when Windows lists no media session but Spotify is running.
@@ -550,4 +579,24 @@ fn thumbnail(props: &windows::Media::Control::GlobalSystemMediaTransportControls
     let mut buf = vec![0u8; n];
     reader.ReadBytes(&mut buf).ok()?;
     Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manager_is_rebuilt_at_most_every_few_seconds() {
+        assert!(!rebuild_due(Duration::from_millis(500)));
+        assert!(rebuild_due(MANAGER_REBUILD));
+    }
+
+    #[test]
+    fn spotify_hunt_is_throttled_but_known_pid_is_not() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(5);
+        assert!(!scan_due(0, now, later));
+        assert!(scan_due(0, later, later));
+        assert!(scan_due(4242, now, later));
+    }
 }

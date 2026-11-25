@@ -52,8 +52,7 @@ use crate::config::IslandConfig;
 
 const WM_MEDIA: u32 = WM_APP + 1;
 const WM_FRAME: u32 = WM_APP + 2;
-static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static FRAME_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PACER: crate::pacer::Pacer = crate::pacer::Pacer::new();
 /// File-picker result (shelf?, paths), handed back from the dialog thread via WM_PICKED.
 const WM_PICKED: u32 = WM_APP + 3;
 static PICKED: std::sync::Mutex<Option<(bool, Vec<String>)>> = std::sync::Mutex::new(None);
@@ -1393,7 +1392,7 @@ impl Island {
     }
 
     fn timer(&mut self, ms: u32) {
-        FAST.store(ms <= 16, Ordering::Relaxed);
+        PACER.set_fast(ms <= 16);
         if self.timer_ms != ms {
             self.timer_ms = ms;
             unsafe { SetTimer(self.hwnd, T_TICK, ms, None) };
@@ -3068,14 +3067,14 @@ impl Island {
         unsafe {
             match msg {
                 WM_FRAME => {
-                    if FAST.load(Ordering::Relaxed) {
+                    if PACER.is_fast() {
                         self.tick();
                     }
                 }
                 WM_TIMER => match wp.0 {
                     T_TICK => {
                         // The vsync pacer drives ticks while animating; the timer is the slow-path fallback.
-                        if !FAST.load(Ordering::Relaxed) || self.last_tick.elapsed() > Duration::from_millis(40) {
+                        if !PACER.is_fast() || self.last_tick.elapsed() > Duration::from_millis(40) {
                             self.tick()
                         }
                     }
@@ -3750,15 +3749,14 @@ unsafe fn create_window() -> Result<HWND> {
     )?;
     // Vsync pacer: while animating, wake the UI thread once per display refresh (SetTimer is capped near 60 Hz).
     let h = hwnd.0 as isize;
-    std::thread::spawn(move || loop {
-        if FAST.load(Ordering::Relaxed) {
-            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-            if !FRAME_PENDING.swap(true, Ordering::AcqRel) && PostMessageW(HWND(h as *mut _), WM_FRAME, WPARAM(0), LPARAM(0)).is_err() {
-                FRAME_PENDING.store(false, Ordering::Release);
-            }
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
+    std::thread::spawn(move || {
+        PACER.run(
+            || unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            },
+            || true,
+            || unsafe { PostMessageW(HWND(h as *mut _), WM_FRAME, WPARAM(0), LPARAM(0)).is_ok() },
+        )
     });
     Ok(hwnd)
 }
@@ -3770,7 +3768,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_GETMINMAXINFO | WM_SIZE | WM_MOVE | WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED => return DefWindowProcW(hwnd, msg, wp, lp),
         // Re-arm the pacer here, not in the handler: a frame that arrives while the app is borrowed (re-entrant
         // message) is dropped by island_message, and a flag left set would stall the pacer until restart.
-        WM_FRAME => FRAME_PENDING.store(false, Ordering::Release),
+        WM_FRAME => PACER.frame_done(),
         _ => {}
     }
     if let Some(r) = crate::app::island_message(msg, wp, lp) {
