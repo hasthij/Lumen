@@ -122,6 +122,10 @@ struct Slot {
     tried_at: Option<Instant>,
     /// Previous track's cover: apps often still serve it for a moment after the title changes.
     prev: Option<Arc<Vec<u8>>>,
+    /// Online cover lookup for players that publish no thumbnail (key, bytes), filled by a helper thread.
+    found: Arc<Mutex<Option<(String, Arc<Vec<u8>>)>>>,
+    busy: Arc<AtomicBool>,
+    lookups: u32,
 }
 
 fn run_inner(rx: mpsc::Receiver<Cmd>, state: Arc<Mutex<Vec<Media>>>, active: Arc<AtomicBool>, hwnd: usize, msg: u32) {
@@ -550,6 +554,7 @@ fn read(s: &Session, slot: &mut Slot) -> Option<Media> {
             // Never keep the previous track's cover while the new one loads.
             slot.key = key;
             slot.tries = 0;
+            slot.lookups = 0;
             slot.prev = slot.art.take();
             slot.gen = slot.gen.wrapping_add(1);
         }
@@ -560,6 +565,30 @@ fn read(s: &Session, slot: &mut Slot) -> Option<Media> {
         if art.is_some() {
             slot.art = art;
             slot.gen = slot.gen.wrapping_add(1);
+        }
+    }
+    if slot.art.is_none() && !artist.is_empty() {
+        let hit = slot.found.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match hit {
+            Some((k, bytes)) if k == slot.key => {
+                slot.art = Some(bytes);
+                slot.gen = slot.gen.wrapping_add(1);
+            }
+            // Cover for a track that is already gone: drop it.
+            Some(_) => {}
+            None if slot.tries >= 6 && slot.lookups < 3 && !slot.busy.swap(true, Ordering::AcqRel) => {
+                slot.lookups += 1;
+                let (found, busy, key) = (slot.found.clone(), slot.busy.clone(), slot.key.clone());
+                // YouTube Music style channel names: "Artist - Topic".
+                let q = format!("{} {}", artist.trim_end_matches(" - Topic"), title);
+                std::thread::spawn(move || {
+                    if let Some((bytes, _)) = fetch_cover(&q) {
+                        *found.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, Arc::new(bytes)));
+                    }
+                    busy.store(false, Ordering::Release);
+                });
+            }
+            None => {}
         }
     }
     Some(Media { id: slot.id.clone(), title, artist, playing, pos, dur, at: Instant::now(), art: slot.art.clone(), art_gen: slot.gen })

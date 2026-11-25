@@ -1516,7 +1516,7 @@ impl Island {
     /// Spotify cover tint: reads the front player's cover once per track, then eases the glass colour to it.
     /// Returns true while the colour is still moving. `dt` of infinity snaps.
     fn step_cover(&mut self, dt: f32) -> bool {
-        let front = if self.cfg.cover_colors { self.ordered().into_iter().next().filter(|m| m.id.to_ascii_lowercase().contains("spotify")) } else { None };
+        let front = if self.cfg.cover_colors { self.ordered().into_iter().next() } else { None };
         let key = front.as_ref().map(|m| (m.id.clone(), m.art_gen)).unwrap_or_default();
         if key != self.cov_key {
             if self.wic.is_none() {
