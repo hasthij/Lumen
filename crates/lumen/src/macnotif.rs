@@ -455,7 +455,7 @@ impl MacNotif {
         // The shell query can stall for tens of ms: never ask in the middle of an animation.
         if !self.was_moving && now.duration_since(self.fs_checked).as_millis() >= 500 {
             self.fs_checked = now;
-            let hold = (!self.cfg.over_fullscreen && fullscreen_busy()) || (self.cfg.respect_focus && focus_on());
+            let hold = exclusive_fullscreen() || (!self.cfg.over_fullscreen && fullscreen_busy()) || (self.cfg.respect_focus && focus_on());
             if hold != self.suppressed {
                 self.suppressed = hold;
                 self.dirty = true;
@@ -920,6 +920,11 @@ fn work_area(mon: HMONITOR) -> RECT {
 /// Windows Focus (do not disturb) is on.
 fn focus_on() -> bool {
     unsafe { matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_QUIET_TIME) }
+}
+
+/// A game in exclusive fullscreen: never draw over it, whatever the setting says.
+fn exclusive_fullscreen() -> bool {
+    unsafe { matches!(SHQueryUserNotificationState(), Ok(s) if s == QUNS_RUNNING_D3D_FULL_SCREEN) }
 }
 
 fn fullscreen_busy() -> bool {

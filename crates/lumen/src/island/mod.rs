@@ -784,6 +784,9 @@ pub struct Island {
     own_seq: u32,
     worker: Option<media::Worker>,
     last_tick: Instant,
+    /// An exclusive-fullscreen game is running: stay hidden, never touch its screen.
+    exclusive_fs: bool,
+    fs_checked: Instant,
     last_draw: Instant,
     dirty: bool,
     timer_ms: u32,
@@ -886,6 +889,8 @@ impl Island {
                 own_seq: 0,
                 worker: Some(worker),
                 last_tick: now,
+                exclusive_fs: false,
+                fs_checked: now - Duration::from_secs(1),
                 last_draw: now,
                 dirty: false,
                 timer_ms: 0,
@@ -1594,6 +1599,20 @@ impl Island {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
+        if now.duration_since(self.fs_checked) >= Duration::from_millis(500) {
+            self.fs_checked = now;
+            self.exclusive_fs = unsafe { SHQueryUserNotificationState() }.map(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN).unwrap_or(false);
+        }
+        if self.exclusive_fs {
+            // Windows over an exclusive-fullscreen game make it flicker or drop out of fullscreen.
+            self.set_mode(Mode::Hidden);
+            if self.shown {
+                unsafe { self.hide() };
+            }
+            self.dirty = false;
+            self.timer(500);
+            return;
+        }
         unsafe { self.pointer(now) };
         let moving = self.step(dt) | self.step_cover(dt);
         self.row_anim = self.step_rows(dt);
