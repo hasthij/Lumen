@@ -15,6 +15,10 @@ pub struct Config {
     pub clock: ClockConfig,
     /// Every skin Lumen knows about, with its own position and look. `enabled` is the switch.
     pub skins: Vec<ClockConfig>,
+    /// While moving skins, they snap onto a shared grid (with the screen center and edges as stops).
+    pub skin_grid: bool,
+    /// The skin last picked in the settings window, so it stays selected next time.
+    pub last_skin: String,
     pub launcher: LauncherConfig,
     pub appearance: Appearance,
     pub taskbar: TaskbarConfig,
@@ -387,6 +391,8 @@ impl Default for Config {
             modules: Modules::default(),
             clock: ClockConfig::default(),
             skins: Vec::new(),
+            skin_grid: true,
+            last_skin: String::new(),
             launcher: LauncherConfig::default(),
             appearance: Appearance::default(),
             taskbar: TaskbarConfig::default(),
@@ -604,12 +610,33 @@ impl Config {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let Ok(text) = toml::to_string_pretty(self) else { return };
+        let text = match toml::to_string_pretty(self) {
+            Ok(t) => t,
+            Err(e) => return crate::warn!("could not serialize config: {e}"),
+        };
         let tmp = path.with_extension("toml.tmp");
-        if fs::write(&tmp, text).is_ok() {
-            if let Err(e) = fs::rename(&tmp, &path) {
-                crate::warn!("could not save config: {e}");
-            }
+        if let Err(e) = fs::write(&tmp, text) {
+            return crate::warn!("could not write config: {e}");
         }
+        if let Err(e) = fs::rename(&tmp, &path) {
+            crate::warn!("could not save config: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn skins_and_last_skin_survive_a_round_trip() {
+        let mut cfg = Config::default();
+        cfg.set_skin_enabled(r"Summit\Time\Time.ini", true);
+        cfg.last_skin = r"Summit\Time\Time.ini".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let mut back: Config = toml::from_str(&text).unwrap();
+        back.migrate_skins(&text);
+        assert_eq!(back.last_skin, cfg.last_skin);
+        assert!(back.skin(r"Summit\Time\Time.ini").is_some_and(|k| k.enabled));
     }
 }

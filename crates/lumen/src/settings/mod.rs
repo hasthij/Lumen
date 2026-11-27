@@ -163,6 +163,7 @@ enum Hit {
     ClockColor(Option<u32>),
     Hour(Option<bool>),
     MoveClock,
+    SkinGrid,
     ResetClock,
     Expand(String),
     SkinToggle(String),
@@ -184,8 +185,8 @@ pub enum Change {
     ReloadSkin,
     /// Pause the global hotkey while the user records a new one.
     RecordingHotkey(bool),
-    /// Start (Some) or stop (None) dragging a skin on the desktop.
-    MoveSkin(Option<String>),
+    /// Start or stop dragging one skin on the desktop; other skins are unaffected.
+    MoveSkin(String, bool),
     QuitTranslucentTB,
     RestoreTaskbar,
     RestartExplorer,
@@ -207,8 +208,8 @@ pub struct Status {
     pub apps: usize,
     pub taskbar: String,
     pub translucenttb: bool,
-    /// The skin being dragged right now, or empty.
-    pub moving_skin: String,
+    /// The skins in move mode right now.
+    pub moving_skins: Vec<String>,
     /// Where Rainmeter's skins live (the Skins folder the clock reads from).
     pub skins_dir: String,
 }
@@ -323,13 +324,18 @@ impl Settings {
             }
         }
         if self.selected.as_ref().map_or(true, |r| !self.cfg.skin(r).is_some_and(|k| k.enabled)) {
-            self.selected = self.cfg.skins.iter().find(|k| k.enabled).map(|k| k.skin.clone());
+            let last = self.cfg.skins.iter().find(|k| k.enabled && k.skin.eq_ignore_ascii_case(&self.cfg.last_skin));
+            self.selected = last.or_else(|| self.cfg.skins.iter().find(|k| k.enabled)).map(|k| k.skin.clone());
         }
     }
 
     /// Settings of the selected skin (defaults when none is selected).
     fn sel(&self) -> crate::config::ClockConfig {
         self.selected.as_deref().and_then(|r| self.cfg.skin(r)).cloned().unwrap_or_default()
+    }
+
+    fn is_moving(&self, rel: &str) -> bool {
+        self.status.moving_skins.iter().any(|m| m.eq_ignore_ascii_case(rel))
     }
 
     fn sel_mut(&mut self) -> Option<&mut crate::config::ClockConfig> {
@@ -781,9 +787,19 @@ impl Settings {
             }
             Hit::MoveClock => {
                 let rel = self.selected.clone().unwrap_or_default();
-                let moving_this = self.status.moving_skin.eq_ignore_ascii_case(&rel) && !rel.is_empty();
-                self.status.moving_skin = if moving_this { String::new() } else { rel.clone() };
-                self.changes.push(Change::MoveSkin(if moving_this { None } else { Some(rel) }));
+                if !rel.is_empty() {
+                    let moving_this = self.is_moving(&rel);
+                    if moving_this {
+                        self.status.moving_skins.retain(|m| !m.eq_ignore_ascii_case(&rel));
+                    } else {
+                        self.status.moving_skins.push(rel.clone());
+                    }
+                    self.changes.push(Change::MoveSkin(rel, !moving_this));
+                }
+            }
+            Hit::SkinGrid => {
+                self.cfg.skin_grid = !self.cfg.skin_grid;
+                self.commit_config();
             }
             Hit::ResetClock => {
                 if let Some(k) = self.sel_mut() {
@@ -803,13 +819,16 @@ impl Settings {
             }
             Hit::SelectSkin(rel) => {
                 if self.cfg.skin(&rel).is_some_and(|k| k.enabled) {
+                    self.cfg.last_skin = rel.clone();
                     self.selected = Some(rel);
+                    self.commit_config();
                 }
             }
             Hit::SkinToggle(rel) => {
                 let on = !self.cfg.skin(&rel).is_some_and(|k| k.enabled);
                 self.cfg.set_skin_enabled(&rel, on);
                 if on {
+                    self.cfg.last_skin = rel.clone();
                     self.selected = Some(rel);
                 } else if self.selected.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&rel)) {
                     self.selected = self.cfg.skins.iter().find(|k| k.enabled).map(|k| k.skin.clone());
@@ -957,8 +976,8 @@ impl Settings {
     fn close(&mut self) {
         self.finish_edit(true);
         self.stop_recording();
-        if !self.status.moving_skin.is_empty() {
-            self.changes.push(Change::MoveSkin(None));
+        for rel in std::mem::take(&mut self.status.moving_skins) {
+            self.changes.push(Change::MoveSkin(rel, false));
         }
         self.closed = true;
         unsafe {
@@ -1584,8 +1603,11 @@ impl Settings {
         self.slider_row(y + 134.0, "Saturation", Slider::ClockSat, Some(&sats));
         y += 176.0 + 20.0;
 
-        let moving = self.status.moving_skin.eq_ignore_ascii_case(&rel);
-        self.card(y, 68.0, Some(('\u{E7C2}', None)), "Move on the desktop", if moving { "Drag the skin on your desktop, then press Done" } else { "Lets you drag this skin to a new spot" });
+        let moving = self.is_moving(&rel);
+        self.card(y, 68.0, Some(('\u{E80A}', None)), "Snap to grid", "Skins lock onto a shared grid, the screen center and the edges while you drag");
+        self.toggle(RIGHT, y + 34.0, self.cfg.skin_grid, Hit::SkinGrid, true);
+        y += 72.0;
+        self.card(y, 68.0, Some(('\u{E7C2}', None)), "Move on the desktop", if moving { "Drag the skin on your desktop, then press Done. Other skins can move too" } else { "Lets you drag this skin to a new spot" });
         let x = self.button(RIGHT, y + 34.0, if moving { "Done" } else { "Move" }, Hit::MoveClock);
         self.button(x - 8.0, y + 34.0, "Reset all", Hit::ResetClock);
         y += 72.0;

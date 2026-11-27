@@ -10,6 +10,8 @@ mod autostart;
 mod clock;
 mod config;
 mod gfx;
+mod gridview;
+mod movebar;
 mod icon;
 mod island;
 mod launcher;
@@ -111,7 +113,7 @@ fn main() {
             apps: 342,
             taskbar: "Connected · clear (desktop)".into(),
             translucenttb: taskbar::translucenttb_running(),
-            moving_skin: String::new(),
+            moving_skins: Vec::new(),
             skins_dir: rainmeter::Install::locate().skins.map(|p| p.display().to_string()).unwrap_or_default(),
         };
         std::process::exit(match settings::snapshot(&cfg, status, page) {

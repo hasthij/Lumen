@@ -8,9 +8,11 @@ use std::path::PathBuf;
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::ClockConfig;
@@ -190,9 +192,14 @@ impl Clock {
         self.skin.as_ref().map(|s| s.unsupported.clone()).unwrap_or_default()
     }
 
+    /// Snap onto the shared grid while dragging (see `snap_axis`).
+    pub fn set_grid(&mut self, on: bool) {
+        self.set_flag(FLAG_GRID, on);
+    }
+
     /// After a drag: reads where the window ended up, in skin pixels.
     pub fn read_position(&mut self) -> (i32, i32) {
-        let mut r = windows::Win32::Foundation::RECT::default();
+        let mut r = RECT::default();
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut r);
         }
@@ -213,6 +220,10 @@ impl Clock {
             self.hide();
             return 5_000;
         };
+        // A timer redraw mid-drag must not yank the window back to its old spot.
+        if self.moving && self.shown {
+            self.read_position();
+        }
         let display = display_scale();
         let scale = display * self.cfg.size.clamp(0.3, 4.0);
         let alpha = (self.alpha as f32 * self.cfg.opacity.clamp(0.1, 1.0)).round() as u8;
@@ -322,7 +333,7 @@ fn overrides(cfg: &ClockConfig) -> Overrides {
 }
 
 /// Rainmeter scales skins by the primary display's scaling (125% → 1.25).
-fn display_scale() -> f32 {
+pub fn display_scale() -> f32 {
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     unsafe {
         let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
@@ -389,6 +400,62 @@ unsafe fn create_window(pos: POINT) -> Result<HWND> {
 const FLAG_MOVING: isize = 1;
 const FLAG_RAISED: isize = 2;
 
+const FLAG_GRID: isize = 4;
+
+/// Grid cell and edge margin, in skin (96-DPI) pixels.
+pub const GRID: f32 = 40.0;
+pub const EDGE_MARGIN: f32 = 24.0;
+
+/// One axis of the shared grid (used while Ctrl is held). Lines sit every `g` px starting `m` px
+/// inside the work area `lo..hi`; the centered and far-edge spots win when within 3/4 of a cell.
+fn snap_axis(v: i32, size: i32, lo: i32, hi: i32, m: i32, g: i32) -> i32 {
+    let origin = lo + m;
+    let line = origin + ((v - origin) as f32 / g as f32).round() as i32 * g;
+    let stops = [lo + (hi - lo - size) / 2, hi - size - m];
+    stops.into_iter().filter(|s| (s - v).abs() <= g * 3 / 4).min_by_key(|s| (s - v).abs()).unwrap_or(line)
+}
+
+/// Snaps a window rect being dragged onto the grid of the monitor it is over.
+unsafe fn snap_rect(r: &mut RECT) {
+    // Drags are free; snapping only happens while Ctrl is held.
+    if GetKeyState(VK_CONTROL.0 as i32) >= 0 {
+        return;
+    }
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let mon = MonitorFromPoint(POINT { x: r.left + w / 2, y: r.top + h / 2 }, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(mon, &mut info).as_bool() {
+        return;
+    }
+    let wa = info.rcWork;
+    let scale = display_scale();
+    let m = (EDGE_MARGIN * scale).round() as i32;
+    let g = (GRID * scale).round().max(1.0) as i32;
+    let (x, y) = (snap_axis(r.left, w, wa.left, wa.right, m, g), snap_axis(r.top, h, wa.top, wa.bottom, m, g));
+    *r = RECT { left: x, top: y, right: x + w, bottom: y + h };
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+
+    #[test]
+    fn centered_window_catches_a_near_drop() {
+        assert_eq!(snap_axis(745, 400, 0, 1920, 24, 40), 760);
+    }
+
+    #[test]
+    fn far_edge_catches_the_right_margin() {
+        assert_eq!(snap_axis(1480, 400, 0, 1920, 24, 40), 1920 - 400 - 24);
+    }
+
+    #[test]
+    fn elsewhere_it_rounds_to_the_nearest_grid_line() {
+        assert_eq!(snap_axis(300, 100, 0, 1920, 24, 40), 304);
+        assert_eq!(snap_axis(290, 100, 0, 1920, 24, 40), 304);
+    }
+}
+
 /// Stateless on purpose: it never touches module state, so it is safe to re-enter from
 /// SetWindowPos/UpdateLayeredWindow calls made while rendering.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -408,6 +475,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // In move mode the whole clock is a drag handle.
         WM_NCHITTEST if flags & FLAG_MOVING != 0 => LRESULT(HTCAPTION as isize),
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        // Live snapping while a skin is dragged.
+        WM_MOVING if flags & FLAG_GRID != 0 => {
+            let r = lp.0 as *mut RECT;
+            if !r.is_null() {
+                snap_rect(&mut *r);
+            }
+            LRESULT(1)
+        }
         WM_EXITSIZEMOVE => {
             if let Ok(app) = FindWindowW(w!("LumenApp"), None) {
                 let _ = PostMessageW(app, crate::app::WM_CLOCK_MOVED, WPARAM(hwnd.0 as usize), LPARAM(0));

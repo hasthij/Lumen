@@ -34,6 +34,8 @@ pub const WM_RESTORE_TASKBAR: u32 = WM_APP + 5;
 const WM_FOREGROUND: u32 = WM_APP + 6;
 /// Posted when the tray menu or settings asks for a sample notification.
 pub const WM_MACNOTIF_TEST: u32 = WM_APP + 7;
+/// The Done button of the move bar was clicked.
+pub const WM_MOVE_DONE: u32 = WM_APP + 8;
 /// Tag on the WM_COPYDATA that carries a notification.
 pub const NOTIFY_MAGIC: usize = 0x4C4E_4F54;
 static APP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -141,6 +143,11 @@ pub struct App {
     cfg: Config,
     /// One window per skin that is switched on.
     skins: Vec<Clock>,
+/// Grid lines shown while skins are being moved.
+grid_overlay: Option<crate::gridview::GridOverlay>,
+    move_bar: Option<crate::movebar::MoveBar>,
+    /// Win+D was sent to show the desktop; sent again to bring the windows back.
+    desktop_shown: bool,
     launcher: Option<Launcher>,
     island: Option<Island>,
     macnotif: Option<MacNotif>,
@@ -164,7 +171,7 @@ pub fn run(open_settings: bool) -> Result<()> {
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
     };
     let cfg = Config::load();
-    let app = App { hwnd, cfg, skins: Vec::new(), launcher: None, island: None, macnotif: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
+    let app = App { hwnd, cfg, skins: Vec::new(), grid_overlay: None, move_bar: None, desktop_shown: false, launcher: None, island: None, macnotif: None, settings: None, taskbar: None, taskbar_note: String::new(), hotkey_ok: false, taskbar_created, icon: crate::icon::create() };
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| {
         app.add_tray();
@@ -291,6 +298,51 @@ impl App {
         self.schedule_trim();
     }
 
+    /// While any skin is in move mode: grid lines (if snapping is on), the Done bar, and the
+    /// desktop shown (settings and other windows out of the way). All undone when moving ends.
+    fn update_grid_overlay(&mut self) {
+        let moving = self.skins.iter().any(|c| c.moving());
+        if self.cfg.skin_grid && moving {
+            if self.grid_overlay.is_none() {
+                match crate::gridview::GridOverlay::show() {
+                    Ok(o) => self.grid_overlay = Some(o),
+                    Err(e) => crate::error!("grid overlay failed: {e}"),
+                }
+            }
+        } else {
+            self.grid_overlay = None;
+        }
+        if moving && self.move_bar.is_none() {
+            match crate::movebar::MoveBar::show() {
+                Ok(b) => self.move_bar = Some(b),
+                Err(e) => crate::error!("move bar failed: {e}"),
+            }
+            if !self.desktop_shown {
+                toggle_desktop();
+                self.desktop_shown = true;
+            }
+        } else if !moving && self.move_bar.is_some() {
+            self.move_bar = None;
+            if self.desktop_shown {
+                toggle_desktop();
+                self.desktop_shown = false;
+            }
+            if let Some(s) = &self.settings {
+                s.focus();
+            }
+        }
+    }
+
+    /// Done clicked: every skin leaves move mode.
+    fn finish_moving(&mut self) {
+        for c in self.skins.iter_mut().filter(|c| c.moving()) {
+            c.set_moving(false);
+        }
+        self.update_grid_overlay();
+        self.clock_tick(true);
+        self.refresh_settings();
+    }
+
     /// Makes the skin windows match the config: windows for skins that were switched on,
     /// settings pushed to ones already running, windows closed for skins switched off.
     fn sync_skins(&mut self) {
@@ -309,6 +361,10 @@ impl App {
                 },
             }
         }
+        for c in self.skins.iter_mut() {
+            c.set_grid(self.cfg.skin_grid);
+        }
+        self.update_grid_overlay();
         if self.skins.is_empty() {
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_CLOCK);
@@ -343,7 +399,7 @@ impl App {
                 None => "Off".into(),
             },
             translucenttb: crate::taskbar::translucenttb_running(),
-            moving_skin: self.skins.iter().find(|c| c.moving()).map(|c| c.rel().to_string()).unwrap_or_default(),
+            moving_skins: self.skins.iter().filter(|c| c.moving()).map(|c| c.rel().to_string()).collect(),
             skins_dir: if self.cfg.clock.skins_path.is_empty() {
                 crate::rainmeter::Install::locate().skins.map(|p| p.display().to_string()).unwrap_or_default()
             } else {
@@ -434,11 +490,12 @@ impl App {
             match change {
                 Change::Config(cfg) => self.apply_config(*cfg, true),
                 Change::Preview(cfg) => self.apply_config(*cfg, false),
-                Change::MoveSkin(which) => {
-                    for c in self.skins.iter_mut() {
-                        let on = which.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(c.rel()));
+                Change::MoveSkin(which, on) => {
+                    // Skins move independently: only the named one changes state.
+                    for c in self.skins.iter_mut().filter(|c| c.rel().eq_ignore_ascii_case(&which)) {
                         c.set_moving(on);
                     }
+                    self.update_grid_overlay();
                     self.clock_tick(true);
                 }
                 Change::MacNotifTest => {
@@ -710,6 +767,10 @@ impl App {
                 }
                 Some(LRESULT(posted as isize))
             }
+            WM_MOVE_DONE => {
+                self.finish_moving();
+                Some(LRESULT(0))
+            }
             WM_MACNOTIF_TEST => {
                 if let Some(m) = self.macnotif.as_mut() {
                     m.post_sample();
@@ -915,4 +976,14 @@ pub fn parse_hotkey(s: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
         }
     }
     Some((mods, key?))
+}
+
+/// Win+D: minimizes every window (or restores them when pressed again).
+fn toggle_desktop() {
+    unsafe {
+        keybd_event(VK_LWIN.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(b'D', 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(b'D', 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
 }
