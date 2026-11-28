@@ -683,7 +683,6 @@ impl Launcher {
                 TIMER_RELEASE => unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_RELEASE);
                     self.renderer.release();
-                    let _ = windows::Win32::System::ProcessStatus::EmptyWorkingSet(windows::Win32::System::Threading::GetCurrentProcess());
                 },
                 _ => {}
             },

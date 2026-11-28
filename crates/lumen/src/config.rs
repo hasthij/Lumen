@@ -640,3 +640,20 @@ mod persist_tests {
         assert!(back.skin(r"Summit\Time\Time.ini").is_some_and(|k| k.enabled));
     }
 }
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn default_engine_is_google_and_url_is_encoded() {
+        let cfg = LauncherConfig::default();
+        assert_eq!(cfg.search_url_for("rust & lumen"), "https://www.google.com/search?q=rust%20%26%20lumen");
+    }
+
+    #[test]
+    fn brave_search_is_only_used_when_chosen() {
+        let cfg = LauncherConfig { search_engine: "brave".into(), ..LauncherConfig::default() };
+        assert!(cfg.search_url_for("x").starts_with("https://search.brave.com/"));
+    }
+}

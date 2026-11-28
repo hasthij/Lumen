@@ -938,10 +938,22 @@ fn memory_mb() -> f32 {
     c.WorkingSetSize as f32 / (1024.0 * 1024.0)
 }
 
-unsafe fn trim_working_set() {
-    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+/// Working set Lumen keeps resident. Emptying it (or Windows trimming it under memory pressure)
+/// sends the island and notification code to disk, so the next open stalls for seconds.
+const PINNED_WS_MIN: usize = 50 << 20;
+const PINNED_WS_MAX: usize = 400 << 20;
+
+/// Locks `PINNED_WS_MIN` bytes into the working set so low memory cannot page the overlays out.
+pub fn pin_working_set() -> bool {
+    use windows::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
     use windows::Win32::System::Threading::GetCurrentProcess;
-    let _ = EmptyWorkingSet(GetCurrentProcess());
+    unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), PINNED_WS_MIN, PINNED_WS_MAX, QUOTA_LIMITS_HARDWS_MIN_ENABLE).is_ok() }
+}
+
+unsafe fn trim_working_set() {
+    if !pin_working_set() {
+        crate::warn!("could not pin the working set");
+    }
 }
 
 /// Logs a taken hotkey once per run instead of every retry.
@@ -985,5 +997,28 @@ fn toggle_desktop() {
         keybd_event(b'D', 0, KEYBD_EVENT_FLAGS(0), 0);
         keybd_event(b'D', 0, KEYEVENTF_KEYUP, 0);
         keybd_event(VK_LWIN.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::System::Memory::{GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_ENABLE};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    #[test]
+    fn pin_working_set_sets_a_hard_minimum() {
+        assert!(super::pin_working_set(), "SetProcessWorkingSetSizeEx failed");
+        let (mut min, mut max, mut flags) = (0usize, 0usize, 0u32);
+        unsafe { GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mut min, &mut max, &mut flags).unwrap() };
+        assert!(min >= super::PINNED_WS_MIN, "minimum working set not raised: {min}");
+        assert!(flags & QUOTA_LIMITS_HARDWS_MIN_ENABLE.0 != 0, "minimum is not hard, Windows can still trim it");
+    }
+
+    #[test]
+    fn nothing_empties_the_working_set() {
+        for (name, src) in [("app.rs", include_str!("app.rs")), ("launcher/mod.rs", include_str!("launcher/mod.rs"))] {
+            let calls = src.lines().filter(|l| !l.trim_start().starts_with("//") && l.contains(concat!("Empty", "WorkingSet("))).count();
+            assert_eq!(calls, 0, "{name} empties the working set; overlays page in from disk after that");
+        }
     }
 }
